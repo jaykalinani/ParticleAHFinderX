@@ -1,0 +1,12 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+SRCS = particle_ah_finder.cxx candidate_manager.cxx \
+       surface_particle_container.cxx \
+       logical_surface_storage.cxx surface_manager.cxx surface_router.cxx \
+       carpetx_adapter.cxx \
+       checkpoint.cxx diagnostics.cxx spherical_surface_export.cxx \
+       io.cxx interpolation_self_test.cxx \
+       angular_self_test.cxx domain_exit_self_test.cxx \
+       relaxation_self_test.cxx
+
+SUBDIRS =

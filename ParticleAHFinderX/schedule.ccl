@@ -1,0 +1,120 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+SCHEDULE ParticleAHFinderX_ParamCheck AT paramcheck
+{
+  LANG: C
+  OPTIONS: global
+} "Validate ParticleAHFinderX parameters and capability assumptions"
+
+if (active) {
+  SCHEDULE ParticleAHFinderX_Setup AT basegrid
+  {
+    LANG: C
+    OPTIONS: global
+  } "Resolve ADM fields and initialize ParticleAHFinderX runtime metadata"
+
+  SCHEDULE ParticleAHFinderX_Initialise AT postinitial
+  {
+    LANG: C
+    OPTIONS: global
+  } "Create configured horizon particles once in persistent AMReX storage"
+
+  SCHEDULE ParticleAHFinderX_Recover AT post_recover_variables
+  {
+    LANG: C
+    OPTIONS: global
+  } "Recover persistent surface particles and logical metadata"
+
+  SCHEDULE ParticleAHFinderX_InterpolationSelfTest AT postinitial
+    AFTER ParticleAHFinderX_Initialise
+  {
+    LANG: C
+    OPTIONS: global
+  } "Validate portable device interpolation against analytic polynomials"
+
+  SCHEDULE ParticleAHFinderX_DomainExitSelfTest AT postinitial
+    AFTER ParticleAHFinderX_Initialise
+    BEFORE ParticleAHFinderX_InterpolationSelfTest
+  {
+    LANG: C
+    OPTIONS: global
+  } "Validate explicit retirement after a surface leaves the physical domain"
+
+  SCHEDULE ParticleAHFinderX_AngularSelfTest AT postinitial
+    AFTER ParticleAHFinderX_InterpolationSelfTest
+  {
+    LANG: C
+    OPTIONS: global
+  } "Validate portable latitude/longitude differential operators"
+
+  SCHEDULE ParticleAHFinderX_RelaxationSelfTest AT postinitial
+    AFTER ParticleAHFinderX_AngularSelfTest
+  {
+    LANG: C
+    OPTIONS: global
+  } "Validate portable internal pseudo-time integration"
+
+  SCHEDULE ParticleAHFinderX_Regrid AT postregrid
+  {
+    LANG: C
+    OPTIONS: global
+  } "Redistribute the existing horizon particles after an AMR regrid"
+
+  SCHEDULE ParticleAHFinderX_Analysis AT analysis
+  {
+    LANG: C
+    OPTIONS: global
+  } "Run due apparent-horizon searches only at synchronized hierarchy times"
+
+  SCHEDULE ParticleAHFinderX_Diagnostics AT analysis
+    AFTER ParticleAHFinderX_Analysis
+  {
+    LANG: C
+    OPTIONS: global
+  } "Write bounded per-surface diagnostics"
+
+  SCHEDULE ParticleAHFinderX_ExportSphericalSurfaces AT analysis
+    AFTER ParticleAHFinderX_Analysis
+    BEFORE SphericalSurface_HasBeenSet
+  {
+    LANG: C
+    OPTIONS: global
+  } "Export selected converged surfaces through the bounded compatibility bridge"
+
+  SCHEDULE ParticleAHFinderX_Output AT analysis
+    AFTER ParticleAHFinderX_Diagnostics
+  {
+    LANG: C
+    OPTIONS: global
+  } "Write synchronized persistent surface particles for visualization"
+
+  SCHEDULE ParticleAHFinderX_CheckpointInitial AT cpinitial
+    AFTER CarpetX_CheckpointInitial
+  {
+    LANG: C
+    OPTIONS: meta
+  } "Write the initial persistent-surface sidecar"
+
+  SCHEDULE ParticleAHFinderX_Checkpoint AT checkpoint
+    AFTER CarpetX_Checkpoint
+  {
+    LANG: C
+    OPTIONS: meta
+  } "Write the persistent-surface checkpoint sidecar"
+
+  SCHEDULE ParticleAHFinderX_CheckpointTerminate AT terminate
+    AFTER CarpetX_CheckpointTerminate
+  {
+    LANG: C
+    OPTIONS: meta
+  } "Write the terminating persistent-surface sidecar"
+
+  # CarpetX schedules its shutdown routine under the alias Driver_Shutdown.
+  # Ordering against that schedule name releases particle containers while
+  # their attached AmrCore objects are still alive.
+  SCHEDULE ParticleAHFinderX_Shutdown AT shutdown BEFORE Driver_Shutdown
+  {
+    LANG: C
+    OPTIONS: meta
+  } "Release ParticleAHFinderX runtime state"
+}

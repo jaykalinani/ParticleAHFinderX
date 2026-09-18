@@ -1,0 +1,43 @@
+ActiveThorns = "
+  ADMBaseX
+  CarpetX
+  IOUtil
+  ParticleAHFinderX
+"
+
+Cactus::presync_mode = "mixed-error"
+Cactus::cctk_itlast = 0
+
+CarpetX::xmin = -2.0
+CarpetX::ymin = -2.0
+CarpetX::zmin = -2.0
+CarpetX::xmax = 2.0
+CarpetX::ymax = 2.0
+CarpetX::zmax = 2.0
+CarpetX::ncells_x = 8
+CarpetX::ncells_y = 8
+CarpetX::ncells_z = 8
+CarpetX::blocking_factor_x = 8
+CarpetX::blocking_factor_y = 8
+CarpetX::blocking_factor_z = 8
+CarpetX::max_grid_size_x = 8
+CarpetX::max_grid_size_y = 8
+CarpetX::max_grid_size_z = 8
+CarpetX::ghost_size = 2
+CarpetX::dtfac = 0.25
+
+ParticleAHFinderX::active = yes
+ParticleAHFinderX::verbose = yes
+ParticleAHFinderX::num_surfaces = 1
+ParticleAHFinderX::find_every = 0
+ParticleAHFinderX::ntheta[0] = 8
+ParticleAHFinderX::nphi[0] = 16
+ParticleAHFinderX::initial_radius[0] = 0.5
+ParticleAHFinderX::retire_on_domain_exit = yes
+ParticleAHFinderX::domain_exit_grace_searches = 1
+ParticleAHFinderX::run_domain_exit_self_test = yes
+ParticleAHFinderX::diagnostics_every = 1
+
+IO::out_dir = $parfile
+IO::parfile_write = "no"
+CarpetX::out_metadata = no

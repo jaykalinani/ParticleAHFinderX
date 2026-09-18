@@ -1,0 +1,77 @@
+ParticleAHFinderX
+=================
+
+ParticleAHFinderX is a CarpetX apparent-horizon finder under development. Its
+surface points will use persistent AMReX particle ownership, while a logical
+cell-centered latitude/longitude view supplies the angular stencil for a
+portable GPU hyperbolic-relaxation solve.
+
+Once a surface is created, its AMReX particles and device allocation live
+across searches and physical timesteps. Searches update the existing population
+in place; regrids redistribute it. Populations are created only for a new
+surface and removed only on explicit retirement or shutdown.
+
+The current thorn validates its configuration, attaches persistent pure-SoA
+containers to CarpetX, creates configured and provisional angular surfaces with
+portable AMReX kernels, and redistributes the same particles after regrids. Its
+narrow checked CarpetX adapter gathers live ADM fields with portable
+trilinear/tensor-cubic interpolation and analytic derivatives. The device path
+evaluates angular derivatives and outgoing expansion, evolves the surface with
+internal SSPRK3 or RK4 pseudo-time relaxation, tracks centers, manages bounded
+common-surface candidates, writes diagnostics/particle output/checkpoints, and
+optionally exports a bounded compatibility surface. A surface repeatedly
+outside a non-periodic physical domain is explicitly retired and its particle
+population is compacted; its stable ID is never reused.
+
+Surface resolution
+------------------
+
+For surface `i`, set `ntheta[i]` and `nphi[i]`. The version-one topology
+requires `nphi = 2*ntheta`, and its particle count is exactly
+`ntheta*nphi`. Examples are 512 particles at `16x32`, the default 2,048 at
+`32x64`, and 8,192 at `64x128`. Resolution is selected at surface birth and is
+not runtime-steerable: changing it later requires an explicit remeshing
+lifecycle operation that preserves lineage and defines new stable particle
+IDs.
+
+The particle count is independent of the mesh interpolation stencil. The
+cubic primitive reads one local `4x4x4` (64-sample) mesh stencil per surface
+particle; it does not create interpolation particles.
+
+Time integration
+----------------
+
+ParticleAHFinderX runs only at synchronized analysis times, after the physical
+evolution step has completed. It therefore works independently of the method
+selected by `ODESolvers`, including explicit, implicit, and IMEX methods. The
+surface finder has its own `relaxation_integrator` parameter; `ssprk3` and
+`rk4` are portable GPU implementations and operate only in pseudo-time while
+the physical metric and curvature slice is frozen.
+
+Center policies
+---------------
+
+Every configured surface has a manual center and radius. The center policy can
+also use generic Cactus real scalars, self-centroid history, or a combination.
+For PunctureTracker, configure for example:
+
+  ParticleAHFinderX::center_policy[0] = "puncture_tracker_displacement"
+  ParticleAHFinderX::external_center_x[0] = "PunctureTracker::pt_loc_x[0]"
+  ParticleAHFinderX::external_center_y[0] = "PunctureTracker::pt_loc_y[0]"
+  ParticleAHFinderX::external_center_z[0] = "PunctureTracker::pt_loc_z[0]"
+
+Before the first successful solve this policy uses the current puncture. Later
+it uses `C_AH(last) + P(now) - P(last)`, retaining the measured AH/puncture
+offset while following the puncture's motion. The external provider supplies a
+center, not a radius. The initial radius is a parameter and later radii come
+from successful surface history.
+
+Residual profiles
+-----------------
+
+The compatibility profile uses loose residual defaults
+`(M*L2, M*Linf)=(1e-2,1e-5)`. The dynamic-tracking profile uses
+`(1e-5,1e-4)`. Select `custom` for independently configured positive values.
+
+See the repository `HANDOFF.md`, `PLAN.md`, and `docs/` directory for the full
+architecture, implementation sequence, and validation requirements.

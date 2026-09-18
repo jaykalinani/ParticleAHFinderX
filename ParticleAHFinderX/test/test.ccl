@@ -1,0 +1,29 @@
+NPROCS 1
+
+TEST persistent-surface-lifecycle
+{
+}
+
+TEST configured-256-surface-batch
+{
+}
+
+TEST interpolation-self-test
+{
+}
+
+TEST angular-self-test
+{
+}
+
+TEST relaxation-self-test
+{
+}
+
+TEST domain-exit-retirement
+{
+}
+
+TEST dynamic-candidate-rejection
+{
+}

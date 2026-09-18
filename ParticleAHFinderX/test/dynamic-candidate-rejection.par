@@ -1,0 +1,72 @@
+# This is a lifecycle smoke test, not a physical flat-spacetime horizon test.
+# Loose parent tolerances establish two tracked synthetic surfaces; the strict
+# candidate tolerance and one-step budget guarantee bounded rejection.
+ActiveThorns = "
+  ADMBaseX
+  CarpetX
+  IOUtil
+  ODESolvers
+  ParticleAHFinderX
+  Subcycling
+"
+
+Cactus::presync_mode = "mixed-error"
+Cactus::cctk_itlast = 3
+
+CarpetX::xmin = -2.0
+CarpetX::ymin = -2.0
+CarpetX::zmin = -2.0
+CarpetX::xmax = 2.0
+CarpetX::ymax = 2.0
+CarpetX::zmax = 2.0
+CarpetX::ncells_x = 16
+CarpetX::ncells_y = 16
+CarpetX::ncells_z = 16
+CarpetX::blocking_factor_x = 8
+CarpetX::blocking_factor_y = 8
+CarpetX::blocking_factor_z = 8
+CarpetX::max_grid_size_x = 8
+CarpetX::max_grid_size_y = 8
+CarpetX::max_grid_size_z = 8
+CarpetX::ghost_size = 2
+CarpetX::dtfac = 0.25
+
+ADMBaseX::initial_data = "Cartesian Minkowski"
+ODESolvers::method = "RK4"
+
+ParticleAHFinderX::active = yes
+ParticleAHFinderX::verbose = yes
+ParticleAHFinderX::num_surfaces = 2
+ParticleAHFinderX::find_every = 1
+ParticleAHFinderX::solve_surfaces = yes
+ParticleAHFinderX::minimum_relaxation_steps = 0
+ParticleAHFinderX::maximum_relaxation_steps = 1
+ParticleAHFinderX::enable_dynamic_common_horizons = yes
+ParticleAHFinderX::maximum_candidate_attempts = 2
+ParticleAHFinderX::candidate_retry_base_iterations = 1
+ParticleAHFinderX::candidate_retry_max_iterations = 8
+ParticleAHFinderX::candidate_theta_l2_tolerance = 1.0e-12
+ParticleAHFinderX::candidate_theta_linf_tolerance = 1.0e-12
+ParticleAHFinderX::candidate_ntheta = 8
+ParticleAHFinderX::candidate_nphi = 16
+ParticleAHFinderX::diagnostics_every = 1
+
+ParticleAHFinderX::ntheta[0] = 8
+ParticleAHFinderX::nphi[0] = 16
+ParticleAHFinderX::initial_center_x[0] = -0.30
+ParticleAHFinderX::initial_radius[0] = 0.50
+ParticleAHFinderX::residual_profile[0] = "custom"
+ParticleAHFinderX::custom_theta_l2_tolerance[0] = 1.0e6
+ParticleAHFinderX::custom_theta_linf_tolerance[0] = 1.0e6
+
+ParticleAHFinderX::ntheta[1] = 8
+ParticleAHFinderX::nphi[1] = 16
+ParticleAHFinderX::initial_center_x[1] = 0.30
+ParticleAHFinderX::initial_radius[1] = 0.50
+ParticleAHFinderX::residual_profile[1] = "custom"
+ParticleAHFinderX::custom_theta_l2_tolerance[1] = 1.0e6
+ParticleAHFinderX::custom_theta_linf_tolerance[1] = 1.0e6
+
+IO::out_dir = $parfile
+IO::parfile_write = "no"
+CarpetX::out_metadata = no

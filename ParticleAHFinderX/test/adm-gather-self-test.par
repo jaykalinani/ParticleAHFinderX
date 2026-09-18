@@ -1,0 +1,50 @@
+ActiveThorns = "
+  ADMBaseX
+  CarpetX
+  IOUtil
+  ODESolvers
+  ParticleAHFinderX
+  Subcycling
+"
+
+Cactus::presync_mode = "mixed-error"
+Cactus::cctk_itlast = 0
+
+CarpetX::xmin = -2.0
+CarpetX::ymin = -2.0
+CarpetX::zmin = -2.0
+CarpetX::xmax = 2.0
+CarpetX::ymax = 2.0
+CarpetX::zmax = 2.0
+CarpetX::ncells_x = 16
+CarpetX::ncells_y = 16
+CarpetX::ncells_z = 16
+CarpetX::blocking_factor_x = 8
+CarpetX::blocking_factor_y = 8
+CarpetX::blocking_factor_z = 8
+CarpetX::max_grid_size_x = 8
+CarpetX::max_grid_size_y = 8
+CarpetX::max_grid_size_z = 8
+CarpetX::ghost_size = 2
+CarpetX::dtfac = 0.25
+
+ADMBaseX::initial_data = "Cartesian Minkowski"
+ODESolvers::method = "RK4"
+
+ParticleAHFinderX::active = yes
+ParticleAHFinderX::verbose = yes
+ParticleAHFinderX::num_surfaces = 1
+ParticleAHFinderX::find_every = 1
+ParticleAHFinderX::interpolation_order = 3
+ParticleAHFinderX::run_adm_gather_self_test = yes
+ParticleAHFinderX::run_expansion_self_test = yes
+ParticleAHFinderX::ntheta[0] = 12
+ParticleAHFinderX::nphi[0] = 24
+ParticleAHFinderX::initial_center_x[0] = 0.125
+ParticleAHFinderX::initial_center_y[0] = -0.125
+ParticleAHFinderX::initial_center_z[0] = 0.0625
+ParticleAHFinderX::initial_radius[0] = 0.625
+
+IO::out_dir = $parfile
+IO::parfile_write = "no"
+CarpetX::out_metadata = no

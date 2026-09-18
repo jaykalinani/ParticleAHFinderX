@@ -1,0 +1,59 @@
+ActiveThorns = "
+  ADMBaseX
+  CarpetX
+  IOUtil
+  ODESolvers
+  ParticleAHFinderX
+  Subcycling
+"
+
+Cactus::presync_mode = "mixed-error"
+Cactus::cctk_itlast = 3
+
+CarpetX::xmin = -2.0
+CarpetX::ymin = -2.0
+CarpetX::zmin = -2.0
+CarpetX::xmax = 2.0
+CarpetX::ymax = 2.0
+CarpetX::zmax = 2.0
+CarpetX::ncells_x = 16
+CarpetX::ncells_y = 16
+CarpetX::ncells_z = 16
+CarpetX::blocking_factor_x = 8
+CarpetX::blocking_factor_y = 8
+CarpetX::blocking_factor_z = 8
+CarpetX::max_grid_size_x = 8
+CarpetX::max_grid_size_y = 8
+CarpetX::max_grid_size_z = 8
+CarpetX::ghost_size = 2
+CarpetX::dtfac = 0.25
+CarpetX::verbose = yes
+
+# AMReX cannot query GPU-aware support from every vendor MPI implementation.
+# This test is run only by a batch script that enables GPU support in Cray
+# MPICH; the explicit override turns on direct device-buffer communication.
+# CarpetX passes this array as argc/argv, so element zero is the conventional
+# program-name placeholder and AMReX parses assignments from element one.
+CarpetX::amrex_parameters[0] = "particleahfinderx"
+CarpetX::amrex_parameters[1] = "amrex.use_gpu_aware_mpi=1"
+
+ODESolvers::method = "RK4"
+
+ParticleAHFinderX::active = yes
+ParticleAHFinderX::verbose = yes
+ParticleAHFinderX::num_surfaces = 2
+ParticleAHFinderX::find_every = 1
+
+ParticleAHFinderX::ntheta[0] = 8
+ParticleAHFinderX::nphi[0] = 16
+ParticleAHFinderX::initial_center_x[0] = -0.35
+ParticleAHFinderX::initial_radius[0] = 0.50
+
+ParticleAHFinderX::ntheta[1] = 10
+ParticleAHFinderX::nphi[1] = 20
+ParticleAHFinderX::initial_center_x[1] = 0.35
+ParticleAHFinderX::initial_radius[1] = 0.65
+
+IO::out_dir = $parfile
+IO::parfile_write = "no"
+CarpetX::out_metadata = no

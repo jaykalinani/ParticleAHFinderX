@@ -1,0 +1,460 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+RESTRICTED:
+
+BOOLEAN active "Enable ParticleAHFinderX"
+{
+} no
+
+BOOLEAN verbose "Print concise setup and search summaries" STEERABLE=always
+{
+} no
+
+BOOLEAN print_timing_stats "Synchronize and report end-to-end GPU solver wall time" STEERABLE=always
+{
+} no
+
+INT diagnostics_every "Write bounded surface diagnostics at this iteration cadence" STEERABLE=always
+{
+  0 :: "Disabled"
+  1:* :: "Diagnostics cadence"
+} 0
+
+STRING diagnostics_out_dir "Surface diagnostics output directory"
+{
+  ".+" :: "Directory path"
+} "particleahfinderx"
+
+BOOLEAN output_compatibility_diagnostics "Write documented 40-column compatibility files"
+{
+} no
+
+BOOLEAN export_spherical_surfaces "Export mapped converged surfaces through the optional SphericalSurface contract"
+{
+} no
+
+INT spherical_surface_index[256] "Fallback zero-based SphericalSurface target for this one-based compatibility slot"
+{
+  -1 :: "No fallback target"
+  0:* :: "Zero-based SphericalSurface index"
+} -1
+
+STRING spherical_surface_name[256] "Optional SphericalSurface name for this one-based compatibility slot"
+{
+  ".*" :: "Empty uses spherical_surface_index; non-empty resolves by name"
+} ""
+
+INT particle_out_every "Write synchronized parallel particle snapshots at this iteration cadence" STEERABLE=always
+{
+  0 :: "Disabled"
+  1:* :: "Output cadence"
+} 0
+
+STRING particle_out_dir "Particle visualization output directory"
+{
+  ".+" :: "Directory path"
+} "particleahfinderx"
+
+KEYWORD particle_out_backend "openPMD particle output backend"
+{
+  "bp5" :: "ADIOS2 BP5"
+} "bp5"
+
+INT debug_tsv_every "Write bounded per-rank particle TSV files at this cadence" STEERABLE=always
+{
+  0 :: "Disabled"
+  1:* :: "Debug output cadence"
+} 0
+
+INT debug_max_particles "Hard global particle limit for debug TSV output"
+{
+  1:* :: "Particle limit"
+} 10000
+
+INT num_surfaces "Number of initially configured apparent-horizon surfaces"
+{
+  0:256 :: "Configured surface count"
+} 0
+
+INT find_every "Search at this synchronized iteration cadence" STEERABLE=always
+{
+  0 :: "Disable scheduled searches"
+  1:* :: "Search cadence"
+} 1
+
+KEYWORD angular_topology "Logical angular topology"
+{
+  "latitude_longitude" :: "Cell-centered latitude/longitude grid with periodic longitude"
+} "latitude_longitude"
+
+KEYWORD logical_ownership "Logical surface ownership policy"
+{
+  "weighted_surface_owner" :: "One logical owner per surface; batch and balance surfaces across owners"
+} "weighted_surface_owner"
+
+BOOLEAN enable_angular_continuation "Allocate persistent coarse-to-fine angular layers for initial acquisition and reacquisition"
+{
+} no
+
+INT angular_continuation_max_levels "Maximum persistent angular layers per physical surface, including the target layer"
+{
+  1:8 :: "One through eight persistent layers"
+} 3
+
+INT angular_continuation_min_ntheta "Smallest allowed theta resolution in the factor-two continuation hierarchy"
+{
+  8:* :: "At least the minimum supported angular stencil size"
+} 8
+
+INT candidate_angular_continuation_min_ntheta "Smallest theta resolution for common-horizon candidates, which can require more angular structure than individual horizons"
+{
+  8:* :: "At least the minimum supported angular stencil size"
+} 16
+
+REAL angular_continuation_cutoff_threshold "Dimensionless high-angular-frequency indicator that immediately promotes an under-resolved non-target layer; zero disables the gate"
+{
+  0:* :: "Non-negative cutoff-content threshold"
+} 0.005
+
+INT interpolation_order "Device tensor-product interpolation order"
+{
+  1 :: "Trilinear bring-up and debugging"
+  3 :: "Cubic production candidate with analytic first derivatives"
+} 3
+
+BOOLEAN run_interpolation_self_test "Run the analytic portable interpolation test at startup"
+{
+} no
+
+BOOLEAN run_adm_gather_self_test "Validate the live native-centered gather against Cartesian Minkowski data"
+{
+} no
+
+BOOLEAN run_angular_self_test "Validate the cell-centered spherical angular stencils"
+{
+} no
+
+BOOLEAN run_expansion_self_test "Validate coordinate-sphere expansion in Cartesian Minkowski data"
+{
+} no
+
+BOOLEAN run_relaxation_self_test "Validate pseudo-time integration and analytic physical relaxation on the active AMReX backend"
+{
+} no
+
+BOOLEAN run_domain_exit_self_test "Validation only: force one proposed surface center outside and verify explicit population retirement"
+{
+} no
+
+BOOLEAN require_gpu_aware_mpi "Require GPU-aware MPI for multi-rank accelerator runs"
+{
+} yes
+
+INT max_num_cells_moved "Maximum displacement in cells for bounded AMReX redistribution"
+{
+  1:* :: "Cell count"
+} 8
+
+BOOLEAN solve_surfaces "Run the GPU hyperbolic-relaxation solver for due surfaces"
+{
+} no
+
+KEYWORD relaxation_integrator "Internal pseudo-time integration method"
+{
+  "ssprk3" :: "Third-order strong-stability-preserving Runge-Kutta"
+  "rk4" :: "Classical fourth-order Runge-Kutta"
+} "ssprk3"
+
+INT maximum_relaxation_steps "Safety ceiling on full pseudo-time steps per search; converged surfaces stop earlier"
+{
+  1:* :: "Step count"
+} 10000
+
+INT minimum_relaxation_steps "Minimum steps before accepting convergence"
+{
+  0:* :: "Step count"
+} 3
+
+INT relaxation_report_every "Report compact per-surface trial residuals at this pseudo-step cadence; zero disables periodic reports"
+{
+  0:* :: "Zero or a positive pseudo-step cadence"
+} 0
+
+REAL relaxation_cfl_factor "Angular CFL factor for internal pseudo-time integration"
+{
+  (0.0:1.05 :: "Positive and no larger than the validated stability limit"
+} 1.0
+
+BOOLEAN use_relaxation_extrapolation "Periodically test and accept only residual-reducing surface extrapolations"
+{
+} yes
+
+REAL relaxation_extrapolation_interval_times_mass "Pseudo-time interval divided by surface mass between extrapolation events"
+{
+  (0.0:* :: "Positive dimensionless interval"
+} 0.7853981633974483
+
+REAL maximum_relaxation_extrapolation_factor "Largest recent-trajectory overstep tested by accepted extrapolation"
+{
+  2.0:* :: "At least the first tested overstep"
+} 16.0
+
+REAL minimum_relaxation_extrapolation_improvement "Minimum relative reduction of the normalized L2/Linfinity convergence ratio required before accepting an extrapolation"
+{
+  [0.0:1.0) :: "Non-negative fractional improvement below one"
+} 0.00005
+
+REAL eta_damping_times_mass "Dimensionless hyperbolic damping eta*M"
+{
+  (0.0:* :: "Positive damping"
+} 1.6
+
+REAL angular_dissipation_strength "Sixth-order angular dissipation strength for both relaxation fields"
+{
+  0.0:1.0 :: "Zero disables dissipation"
+} 0.0
+
+REAL minimum_radius_factor "Reject trial heights below this fraction of the birth radius"
+{
+  (0.0:1.0 :: "Lower radius guard"
+} 0.05
+
+REAL maximum_radius_factor "Reject trial heights above this multiple of the birth radius"
+{
+  (1.0:* :: "Upper radius guard"
+} 4.0
+
+REAL maximum_center_extrapolation_intervals "Limit self-center prediction to this many recent search intervals"
+{
+  0.0:* :: "Non-negative extrapolation interval limit"
+} 2.0
+
+BOOLEAN retire_on_domain_exit "Explicitly retire a surface that repeatedly no longer fits the physical domain"
+{
+} yes
+
+INT domain_exit_grace_searches "Consecutive synchronized due searches outside a non-periodic domain before retirement"
+{
+  1:* :: "Positive number of withheld searches"
+} 2
+
+BOOLEAN enable_dynamic_common_horizons "Create provisional pairwise common-surface candidates at run time"
+{
+} no
+
+INT candidate_find_every "Search cadence for provisional and promoted common surfaces"
+{
+  1:* :: "Positive synchronized-iteration cadence"
+} 1
+
+INT candidate_ntheta "Initial theta resolution for dynamically created candidates"
+{
+  8:* :: "At least eight theta points"
+} 16
+
+INT candidate_nphi "Initial periodic longitude resolution for dynamically created candidates"
+{
+  16:* :: "At least sixteen longitude points"
+} 32
+
+INT maximum_active_candidates "Hard limit on simultaneous provisional common surfaces"
+{
+  1:* :: "Positive active-candidate bound"
+} 64
+
+INT maximum_new_candidates_per_search "Hard limit on pairwise candidate births at one analysis point"
+{
+  1:* :: "Positive birth bound"
+} 8
+
+REAL candidate_trigger_factor "Trigger when parent-center separation is below this factor times their bounding radii sum"
+{
+  (0.0:* :: "Positive trigger factor"
+} 2.0
+
+REAL candidate_expiry_factor "Expire an unconverged candidate after separation exceeds this multiple of its birth trigger distance"
+{
+  (1.0:* :: "Must exceed one"
+} 1.25
+
+REAL candidate_initial_radius_factor "Initial candidate radius relative to the enclosing parent radius"
+{
+  (1.0:* :: "Start outside the parent bounding spheres"
+} 1.15
+
+REAL candidate_radius_growth_factor "Radius multiplier after a failed candidate solve"
+{
+  (1.0:* :: "Increase the retry radius"
+} 1.2
+
+REAL candidate_maximum_radius_factor "Maximum retry radius relative to the enclosing parent radius"
+{
+  (1.0:* :: "Upper radius bracket"
+} 2.0
+
+INT maximum_candidate_attempts "Maximum nonlinear searches before retiring one provisional candidate"
+{
+  1:* :: "Positive attempt limit"
+} 6
+
+INT candidate_retry_base_iterations "Base physical-iteration delay after the first failed attempt"
+{
+  1:* :: "Positive retry delay"
+} 1
+
+INT candidate_retry_max_iterations "Maximum exponential retry delay and same-pair cooldown"
+{
+  1:* :: "Positive backoff cap"
+} 64
+
+REAL candidate_containment_tolerance "Fractional coordinate tolerance in the independent parent-bounds containment check"
+{
+  0.0:0.25 :: "Non-negative bounded tolerance"
+} 0.02
+
+REAL candidate_deduplication_center_tolerance "Centroid-distance tolerance in units of the smaller mean radius"
+{
+  0.0:* :: "Non-negative deduplication tolerance"
+} 0.1
+
+REAL candidate_deduplication_area_tolerance "Relative area tolerance for duplicate common surfaces"
+{
+  0.0:1.0 :: "Relative area tolerance"
+} 0.1
+
+BOOLEAN retire_parents_after_common "Explicitly retire both parents after a promoted common surface and grace interval"
+{
+} no
+
+INT common_parent_grace_iterations "Search grace interval before explicitly retiring promoted parents"
+{
+  0:* :: "Non-negative physical iteration count"
+} 0
+
+REAL candidate_theta_l2_tolerance "M times area-weighted L2 tolerance for common candidates"
+{
+  (0.0:* :: "Positive dimensionless tolerance"
+} 1.0e-5
+
+REAL candidate_theta_linf_tolerance "M times L-infinity tolerance for common candidates"
+{
+  (0.0:* :: "Positive dimensionless tolerance"
+} 1.0e-4
+
+BOOLEAN surface_enabled[256] "Enable this initially configured surface"
+{
+} yes
+
+KEYWORD initial_role[256] "Semantic role of this configured surface"
+{
+  "individual" :: "An individual horizon eligible as a candidate parent"
+  "common" :: "A managed common-horizon seed excluded from pairwise parent selection"
+  "other" :: "A managed surface excluded from pairwise parent selection"
+} "individual"
+
+INT find_every_surface[256] "Per-surface search cadence; -1 uses find_every" STEERABLE=always
+{
+  -1:* :: "-1 uses the global cadence; 0 disables this surface; positive values set a cadence"
+} -1
+
+INT ntheta[256] "Number of cell-centered latitude points"
+{
+  8:* :: "At least eight theta points"
+} 32
+
+INT nphi[256] "Number of periodic longitude points"
+{
+  16:* :: "At least sixteen phi points"
+} 64
+
+REAL initial_center_x[256] "Manual/fallback initial x center"
+{
+  *:* :: "Coordinate"
+} 0.0
+
+REAL initial_center_y[256] "Manual/fallback initial y center"
+{
+  *:* :: "Coordinate"
+} 0.0
+
+REAL initial_center_z[256] "Manual/fallback initial z center"
+{
+  *:* :: "Coordinate"
+} 0.0
+
+REAL initial_radius[256] "Manual/fallback initial coordinate radius"
+{
+  (0.0:* :: "Positive radius"
+} 1.0
+
+REAL mass_scale[256] "Characteristic mass used to make expansion norms dimensionless"
+{
+  (0.0:* :: "Positive mass scale"
+} 1.0
+
+KEYWORD center_policy[256] "Center source and fallback policy"
+{
+  "manual" :: "Use the configured manual center"
+  "external" :: "Use external Cactus scalars with manual fallback"
+  "puncture_tracker" :: "Use configured PunctureTracker location scalars with manual fallback"
+  "puncture_tracker_displacement" :: "Translate the last successful AH centroid by puncture displacement; use the puncture directly before first success"
+  "centroid" :: "Use self-centroid history after the manual first search"
+  "external_then_centroid" :: "Use external scalars until a horizon is found, then self-centroid history"
+  "centroid_then_external" :: "Prefer self-centroid history, then external scalars, then manual fallback"
+  "blend_external_centroid" :: "Blend external and self-centroid predictions when both are available"
+} "manual"
+
+STRING external_center_x[256] "Cactus real scalar providing the external x center"
+{
+  "^$" :: "No external provider"
+  ".+::.+" :: "Qualified Cactus scalar, optionally with an array index"
+} ""
+
+STRING external_center_y[256] "Cactus real scalar providing the external y center"
+{
+  "^$" :: "No external provider"
+  ".+::.+" :: "Qualified Cactus scalar, optionally with an array index"
+} ""
+
+STRING external_center_z[256] "Cactus real scalar providing the external z center"
+{
+  "^$" :: "No external provider"
+  ".+::.+" :: "Qualified Cactus scalar, optionally with an array index"
+} ""
+
+REAL external_center_weight[256] "External-center weight in blend_external_centroid mode"
+{
+  0.0:1.0 :: "Zero selects the centroid and one selects the external center"
+} 0.5
+
+BOOLEAN predict_centers[256] "Extrapolate available center history to the current physical time"
+{
+} yes
+
+KEYWORD residual_profile[256] "Expansion-residual convergence profile"
+{
+  "compatibility" :: "Loose residual defaults: M*L2=1e-2 and M*Linf=1e-5"
+  "dynamic_tracking" :: "Area-oriented tracking defaults: M*L2=1e-5 and M*Linf=1e-4"
+  "custom" :: "Use custom_theta_l2_tolerance and custom_theta_linf_tolerance"
+} "compatibility"
+
+REAL custom_theta_l2_tolerance[256] "Custom M times area-weighted L2 expansion tolerance"
+{
+  (0.0:* :: "Positive dimensionless tolerance"
+} 1.0e-5
+
+REAL custom_theta_linf_tolerance[256] "Custom M times L-infinity expansion tolerance"
+{
+  (0.0:* :: "Positive dimensionless tolerance"
+} 1.0e-5
+
+SHARES: IO
+USES BOOLEAN checkpoint_ID
+USES INT checkpoint_every
+USES REAL checkpoint_every_walltime_hours
+USES BOOLEAN checkpoint_on_terminate
+USES STRING checkpoint_dir
+USES STRING checkpoint_file
+USES KEYWORD recover
+USES STRING recover_dir
+USES STRING recover_file

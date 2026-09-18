@@ -1,0 +1,13 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+REQUIRES CarpetX AMReX Loop MPI IOUtil
+
+OPTIONAL openPMD_api
+{
+}
+
+REQUIRES THORNS: ADMBaseX
+
+PROVIDES ParticleAHFinderX
+{
+}

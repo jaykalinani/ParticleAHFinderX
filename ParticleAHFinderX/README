@@ -1,77 +1,262 @@
-ParticleAHFinderX
-=================
+Cactus Code Thorn ParticleAHFinderX
+Core Author(s)  : Jay Kalinani <jaykalinani@gmail.com>
+Licence         : GPL-3.0-or-later
+--------------------------------------------------------------------------
 
-ParticleAHFinderX is a CarpetX apparent-horizon finder under development. Its
-surface points will use persistent AMReX particle ownership, while a logical
-cell-centered latitude/longitude view supplies the angular stencil for a
-portable GPU hyperbolic-relaxation solve.
+1. Purpose
+==========
 
-Once a surface is created, its AMReX particles and device allocation live
-across searches and physical timesteps. Searches update the existing population
-in place; regrids redistribute it. Populations are created only for a new
-surface and removed only on explicit retirement or shutdown.
+ParticleAHFinderX finds and tracks apparent horizons in CarpetX simulations.
+It represents every trial surface with persistent AMReX particles and performs
+mesh interpolation, surface geometry, nonlinear relaxation, reductions, and
+particle updates with portable accelerator kernels.
 
-The current thorn validates its configuration, attaches persistent pure-SoA
-containers to CarpetX, creates configured and provisional angular surfaces with
-portable AMReX kernels, and redistributes the same particles after regrids. Its
-narrow checked CarpetX adapter gathers live ADM fields with portable
-trilinear/tensor-cubic interpolation and analytic derivatives. The device path
-evaluates angular derivatives and outgoing expansion, evolves the surface with
-internal SSPRK3 or RK4 pseudo-time relaxation, tracks centers, manages bounded
-common-surface candidates, writes diagnostics/particle output/checkpoints, and
-optionally exports a bounded compatibility surface. A surface repeatedly
-outside a non-periodic physical domain is explicitly retired and its particle
-population is compacted; its stable ID is never reused.
+Particles are created only when a surface is born and removed only when it is
+explicitly retired. They remain in AMReX storage across searches, physical
+timesteps, regrids, and checkpoints. Host transfers are restricted to bounded
+diagnostics, output, and optional compatibility data.
 
-Surface resolution
-------------------
 
-For surface `i`, set `ntheta[i]` and `nphi[i]`. The version-one topology
-requires `nphi = 2*ntheta`, and its particle count is exactly
-`ntheta*nphi`. Examples are 512 particles at `16x32`, the default 2,048 at
-`32x64`, and 8,192 at `64x128`. Resolution is selected at surface birth and is
-not runtime-steerable: changing it later requires an explicit remeshing
-lifecycle operation that preserves lineage and defines new stable particle
-IDs.
+2. Mathematical Formulation
+===========================
 
-The particle count is independent of the mesh interpolation stencil. The
-cubic primitive reads one local `4x4x4` (64-sample) mesh stencil per surface
-particle; it does not create interpolation particles.
+ParticleAHFinderX represents one star-shaped closed surface as the radial
+graph
 
-Time integration
-----------------
+  x^i(theta, phi) = C^i + h(theta, phi) n^i(theta, phi),
 
-ParticleAHFinderX runs only at synchronized analysis times, after the physical
-evolution step has completed. It therefore works independently of the method
-selected by `ODESolvers`, including explicit, implicit, and IMEX methods. The
-surface finder has its own `relaxation_integrator` parameter; `ssprk3` and
-`rk4` are portable GPU implementations and operate only in pseudo-time while
-the physical metric and curvature slice is frozen.
+where C^i is the tracking center and
 
-Center policies
----------------
+  n^i = (sin(theta) cos(phi), sin(theta) sin(phi), cos(theta)).
 
-Every configured surface has a manual center and radius. The center policy can
-also use generic Cactus real scalars, self-centroid history, or a combination.
-For PunctureTracker, configure for example:
+Let e_A^i = partial_A x^i, with A in {theta, phi}. The induced two-metric and
+surface area are
+
+  q_AB = gamma_ij e_A^i e_B^j,
+  A    = integral sqrt(det(q_AB)) dtheta dphi.
+
+The outward unit normal is obtained from the cross product of the two tangent
+vectors and normalized with the inverse spatial metric:
+
+  N_i = epsilon_ijk e_theta^j e_phi^k,
+  s_i = N_i / sqrt(gamma^jk N_j N_k),
+  s^i = gamma^ij s_j.
+
+With the sign convention used by the thorn, the outgoing-null expansion is
+
+  Theta = D_i s^i + K_ij s^i s^j - K,
+  K     = gamma^ij K_ij.
+
+The divergence is evaluated intrinsically on the surface. In particular,
+
+  b_AB       = -s_i (partial_A partial_B x^i
+                      + Gamma^i_jk e_A^j e_B^k),
+  D_i s^i    = q^AB b_AB.
+
+A marginally outer trapped surface satisfies Theta = 0. The outermost such
+surface on a slice is the apparent horizon. The reported irreducible mass and
+areal radius are
+
+  M_irr = sqrt(A / (16 pi)),
+  R_A   = sqrt(A / (4 pi)).
+
+
+3. Hyperbolic Relaxation
+========================
+
+The nonlinear MOTS equation is solved in an artificial pseudo-time tau. The
+surface height h and an auxiliary field v obey
+
+  partial_tau h = v - eta h + Q_h,
+  partial_tau v = -Theta    + Q_v,
+
+where eta = (eta*M)/M is set by `eta_damping_times_mass`, the relaxation wave
+speed is one, and Q_h and Q_v are optional sixth-order angular dissipation
+terms. Dissipation is disabled by default. At a stationary solution without
+dissipation, partial_tau v = 0 implies Theta = 0.
+
+The pseudo-time system is integrated with either SSPRK3 or classical RK4. It
+is separate from the physical evolution and is independent of the method
+selected by ODESolvers. The spacetime remains at one physical time throughout
+the search. Metric samples are held fixed across the stages of one pseudo-time
+step and gathered again at the updated particle positions after the complete
+step.
+
+For each surface, the timestep is
+
+  Delta tau = CFL min_p [h_p min(Delta theta,
+                                 sin(theta_p) Delta phi)].
+
+The cell-centered latitude/longitude grid is
+
+  theta_i = pi (i + 1/2) / N_theta,
+  phi_j   = 2 pi (j + 1/2) / N_phi,
+
+with N_phi = 2 N_theta. Longitude is periodic. A stencil reflected through a
+pole is shifted by pi in longitude. First and second angular derivatives use
+centered sixth-order finite differences.
+
+Convergence requires both mass-scaled expansion norms to pass:
+
+  ||Theta||_2   = sqrt[(1/A) sum_p Theta_p^2 w_p],
+  ||Theta||_inf = max_p |Theta_p|,
+
+  M ||Theta||_2   <= epsilon_2,
+  M ||Theta||_inf <= epsilon_inf,
+
+where w_p is the discrete proper-area weight. Invalid geometry, a missing
+interpolation stencil, a non-finite update, or a radius-guard violation fails
+that surface and restores its last committed state.
+
+
+4. Spatial and Angular Discretization
+======================================
+
+AMReX position determines a particle's mesh rank, box, and refinement level.
+An immutable `(itheta, iphi)` index determines its angular neighbors; particle
+storage order is never used as an angular stencil.
+
+The production interpolation path reads the native centering of the ADMBaseX
+fields. At every particle it uses one tensor-product 4x4x4 cubic stencil to
+gather the six independent components of gamma_ij and K_ij. The eighteen
+Cartesian derivatives partial_k gamma_ij are differentiated analytically from
+the same cubic polynomial. Trilinear interpolation is retained only as a
+bring-up option.
+
+Each point uses the finest valid AMR level that contains the complete stencil
+in valid data or synchronized ghost zones. The interpolator never silently
+clamps a point or mixes levels within one stencil.
+
+A surface contains exactly N_theta N_phi particles at each angular layer. The
+standard target grid is 32x64, or 2,048 particles. With angular continuation,
+the persistent 8x16, 16x32, and 32x64 layers are allocated together at surface
+birth. A coarse solution is cubically prolonged on the owner GPU; only a
+converged target layer is published. A high-frequency adequacy indicator can
+promote an under-resolved coarse layer early.
+
+
+5. Numerical Algorithm
+======================
+
+At every synchronized search time, the thorn performs the following steps:
+
+1. Select due surfaces and predict their centers. A tracked surface keeps its
+   last successful shape instead of being reset to a sphere.
+2. Preflight each proposed surface against the physical domain. Repeatedly
+   unsupported surfaces are explicitly retired.
+3. Redistribute persistent particles to their AMReX mesh owners and select the
+   finest level with a complete interpolation stencil.
+4. Gather gamma_ij, partial_k gamma_ij, and K_ij on the device, then route the
+   compact samples to the logical owner GPU for each surface.
+5. Compute sixth-order angular derivatives of h, the normal, proper-area
+   weights, Theta, and the two residual norms.
+6. Advance h and v with SSPRK3 or RK4 using the per-surface CFL timestep.
+   Radius and finite-value checks are applied atomically per surface.
+7. Rebuild particle positions, redistribute as needed, and resample the same
+   physical-time geometry after each complete pseudo-time step.
+8. Stop converged surfaces immediately. Optionally test recent-trajectory
+   extrapolations and accept only those that reduce the normalized residual.
+9. For angular continuation, prolong a successful coarse layer and repeat the
+   solve through the configured target layer.
+10. Atomically commit successful surfaces. Failed searches restore the last
+    committed shape and update retry state without publishing a partial result.
+
+All complete logical surfaces are load-balanced across the available GPUs by
+particle count. The spatial particles of one surface may still be distributed
+over many ranks. Mesh gathering, routing, angular work, and solver reductions
+remain device-resident and use GPU-aware MPI in multi-rank accelerator runs.
+
+
+6. Tracking and Dynamic Common Horizons
+=======================================
+
+Manual, external-scalar, centroid, and hybrid center policies are available.
+The recommended moving-puncture policy translates the last successful horizon
+centroid by the puncture displacement since that solve:
+
+  C_guess(t) = C_AH(t_last) + P(t) - P(t_last).
+
+Pairwise proximity creates only a provisional common-surface candidate; it is
+not treated as proof of a merger. Each candidate has persistent particles, a
+new stable ID, parent IDs, a bounded radius bracket, and exponential retry
+backoff. Promotion requires nonlinear convergence, containment of both
+parents, and duplicate rejection. A failed close-fly-by candidate expires
+without changing either parent. General unseeded and non-star-shaped MOTS
+discovery is not currently implemented.
+
+
+7. Quick Start
+==============
+
+Add `ParticleAHFinderX/ParticleAHFinderX` to the thornlist. A minimal
+single-surface configuration is:
+
+  ActiveThorns = "ParticleAHFinderX"
+
+  ParticleAHFinderX::active = yes
+  ParticleAHFinderX::solve_surfaces = yes
+  ParticleAHFinderX::num_surfaces = 1
+  ParticleAHFinderX::find_every = 1
+
+  ParticleAHFinderX::ntheta[0] = 32
+  ParticleAHFinderX::nphi[0] = 64
+  ParticleAHFinderX::initial_center_x[0] = 0.0
+  ParticleAHFinderX::initial_center_y[0] = 0.0
+  ParticleAHFinderX::initial_center_z[0] = 0.0
+  ParticleAHFinderX::initial_radius[0] = 1.0
+  ParticleAHFinderX::mass_scale[0] = 1.0
+  ParticleAHFinderX::residual_profile[0] = "dynamic_tracking"
+
+  ParticleAHFinderX::enable_angular_continuation = yes
+  ParticleAHFinderX::relaxation_integrator = "ssprk3"
+  ParticleAHFinderX::diagnostics_every = 1
+
+For hybrid PunctureTracker motion, additionally set:
 
   ParticleAHFinderX::center_policy[0] = "puncture_tracker_displacement"
   ParticleAHFinderX::external_center_x[0] = "PunctureTracker::pt_loc_x[0]"
   ParticleAHFinderX::external_center_y[0] = "PunctureTracker::pt_loc_y[0]"
   ParticleAHFinderX::external_center_z[0] = "PunctureTracker::pt_loc_z[0]"
 
-Before the first successful solve this policy uses the current puncture. Later
-it uses `C_AH(last) + P(now) - P(last)`, retaining the measured AH/puncture
-offset while following the puncture's motion. The external provider supplies a
-center, not a radius. The initial radius is a parameter and later radii come
-from successful surface history.
+See `param.ccl` for all parameters and `test/` for small regression inputs.
 
-Residual profiles
------------------
 
-The compatibility profile uses loose residual defaults
-`(M*L2, M*Linf)=(1e-2,1e-5)`. The dynamic-tracking profile uses
-`(1e-5,1e-4)`. Select `custom` for independently configured positive values.
+8. Output and Coupling
+======================
 
-See the repository `HANDOFF.md`, `PLAN.md`, and `docs/` directory for the full
-architecture, implementation sequence, and validation requirements.
+`diagnostics_every` writes bounded per-surface diagnostics, including stable
+IDs, lineage, center, radii, area, irreducible mass, circumferences, expansion
+norms, solver steps, and sampled AMR levels. `particle_out_every` writes
+parallel openPMD/ADIOS2 BP5 particle snapshots for visualization.
+
+Optional compatibility output provides familiar `BH_diagnostics.ahN.gp`
+files and bounded SphericalSurface export. These host-side products are
+outside the nonlinear solver loop. Checkpoints preserve particles, logical
+surface state, tracking history, candidates, lineage, and output state, and
+may be recovered with a different MPI rank count.
+
+
+9. Current Limitations
+======================
+
+- Searches currently run only at fully synchronized CarpetX hierarchy times.
+- The supported geometry is one star-shaped S^2 radial graph per surface.
+- One logical GPU owns each complete angular surface; a single surface is not
+  angularly sharded.
+- Only a Cartesian CarpetX patch is currently supported.
+- CUDA and CPU/OpenMP builds have been exercised; HIP and SYCL validation is
+  still pending.
+
+
+10. References
+==============
+
+- Z. B. Etienne, T. Assumpcao, L. R. Werneck, and S. D. Tootle,
+  arXiv:2505.15912, https://arxiv.org/abs/2505.15912.
+- J. Thornburg, Class. Quantum Grav. 21, 743-766 (2004),
+  https://doi.org/10.1088/0264-9381/21/2/026.
+- F. Loeffler et al., Class. Quantum Grav. 29, 115001 (2012),
+  arXiv:1111.3344.
+
+ParticleAHFinderX is distributed under the GNU General Public License v3.0 or
+later. See the repository `LICENSE` file.

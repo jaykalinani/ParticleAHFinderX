@@ -1,7 +1,7 @@
 # ParticleAHFinderX
 
 [![AMReX](https://amrex-codes.github.io/badges/powered%20by-AMReX-red.svg)](https://amrex-codes.github.io)
-[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/jaykalinani/ParticleAHFinderX)
+[![Ask DeepWiki](https://img.shields.io/badge/Ask-DeepWiki-1fa669?style=flat&colorA=080f12&colorB=1fa669)](https://deepwiki.com/jaykalinani/ParticleAHFinderX)
 
 **ParticleAHFinderX** is a GPU-accelerated apparent-horizon finder for
 dynamical spacetimes. It is written in C++ for the

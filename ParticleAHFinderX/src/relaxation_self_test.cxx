@@ -5,6 +5,7 @@
 #include "relaxation.hxx"
 #include "angular_geometry.hxx"
 #include "expansion.hxx"
+#include "runtime.hxx"
 
 #include <cctk.h>
 #include <cctk_Arguments.h>
@@ -40,7 +41,8 @@ absolute_value(const amrex::Real value) noexcept {
 
 extern "C" void ParticleAHFinderX_RelaxationSelfTest(CCTK_ARGUMENTS) {
   DECLARE_CCTK_PARAMETERS;
-  if (!run_relaxation_self_test)
+  auto &state = runtime();
+  if (!run_relaxation_self_test || state.relaxation_self_test_complete)
     return;
 
   constexpr int num_integrators = 2;
@@ -55,13 +57,22 @@ extern "C" void ParticleAHFinderX_RelaxationSelfTest(CCTK_ARGUMENTS) {
         constexpr amrex::Real initial_value = 1;
         constexpr amrex::Real eigenvalue = -2;
         constexpr amrex::Real dt = amrex::Real(0.1);
-        amrex::Real rhs[4]{0, 0, 0, 0};
+        amrex::Real base[2]{initial_value, initial_value};
+        amrex::Real rhs[8]{0, 0, 0, 0, 0, 0, 0, 0};
         amrex::Real value = initial_value;
         for (int stage = 0; stage < relaxation_stage_count(integrator);
              ++stage) {
-          rhs[stage] = eigenvalue * value;
-          value = relaxation_stage_value(integrator, stage, initial_value, dt,
-                                         rhs[0], rhs[1], rhs[2], rhs[stage]);
+          const amrex::Real current_rhs = eigenvalue * value;
+          rhs[2 * stage] = current_rhs;
+          rhs[2 * stage + 1] = current_rhs;
+          const auto update = relaxation_stage_update(
+              integrator, stage, 1, 0, base, rhs, dt, current_rhs,
+              current_rhs, amrex::Real(0), amrex::Real(2));
+          if (!update.valid || update.velocity != update.height) {
+            results[index] = std::numeric_limits<amrex::Real>::max();
+            return;
+          }
+          value = update.height;
         }
         results[index] = value;
       });
@@ -80,13 +91,18 @@ extern "C" void ParticleAHFinderX_RelaxationSelfTest(CCTK_ARGUMENTS) {
   amrex::ParallelFor(1, [=] AMREX_GPU_DEVICE(const int) noexcept {
     results[0] = relaxation_extrapolated_height(
         amrex::Real(0.3), amrex::Real(0.28), amrex::Real(3));
-    const amrex::Real mean_height = relaxation_extrapolated_mean_height(
+    const amrex::Real low_modes = relaxation_extrapolated_low_modes(
         amrex::Real(0.3), amrex::Real(-0.02), amrex::Real(3));
     const amrex::Real ratio = relaxation_residual_ratio(
         amrex::Real(4), amrex::Real(3), amrex::Real(0.5), amrex::Real(1),
         amrex::Real(2));
-    results[1] = absolute_value(mean_height - amrex::Real(0.26)) +
-                 absolute_value(ratio - amrex::Real(2));
+    const amrex::Real schedule_error =
+        (relaxation_extrapolation_reference_event(1) ? 0 : 1) +
+        (relaxation_extrapolation_reference_event(2) ? 1 : 0) +
+        (relaxation_extrapolation_reference_event(3) ? 0 : 1) +
+        (relaxation_extrapolation_reference_event(4) ? 1 : 0);
+    results[1] = absolute_value(low_modes - amrex::Real(0.26)) +
+                 absolute_value(ratio - amrex::Real(2)) + schedule_error;
   });
   amrex::Gpu::copy(amrex::Gpu::deviceToHost, device_results.begin(),
                    device_results.end(), host_results);
@@ -247,6 +263,7 @@ extern "C" void ParticleAHFinderX_RelaxationSelfTest(CCTK_ARGUMENTS) {
       "physical relaxation error=%.3g extrapolation error=%.3g",
       double(stage_error), double(host_expansion_error),
       double(physical_error), double(extrapolation_error));
+  state.relaxation_self_test_complete = true;
 }
 
 } // namespace ParticleAHFinderX

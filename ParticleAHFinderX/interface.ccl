@@ -7,9 +7,14 @@ INHERITS: ADMBaseX
 USES INCLUDE HEADER: driver.hxx
 USES INCLUDE HEADER: schedule.hxx
 
-# Optional name-based compatibility mapping. The provider is required only
-# when SphericalSurface export is explicitly enabled.
-CCTK_INT FUNCTION sf_IdFromName (
-  CCTK_INT IN fallbackid,
-  CCTK_POINTER_TO_CONST IN name)
-USES FUNCTION sf_IdFromName
+INCLUDES HEADER: analysis_api.hxx IN particleahfinderx_analysis.hxx
+
+CCTK_INT FUNCTION ParticleAHFinderX_MeasureInitialMasses(
+  CCTK_POINTER_TO_CONST IN cctkGH,
+  CCTK_INT IN npunctures,
+  CCTK_REAL OUT ARRAY measured_mass,
+  CCTK_INT OUT ARRAY valid)
+
+PROVIDES FUNCTION ParticleAHFinderX_MeasureInitialMasses
+  WITH ParticleAHFinderX_MeasureInitialMasses_Impl
+  LANGUAGE C

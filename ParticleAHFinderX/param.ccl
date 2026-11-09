@@ -10,7 +10,7 @@ BOOLEAN verbose "Print concise setup and search summaries" STEERABLE=always
 {
 } no
 
-BOOLEAN print_timing_stats "Synchronize and report end-to-end GPU solver wall time" STEERABLE=always
+BOOLEAN print_timing_stats "Report end-to-end solver timing plus routing transfer and synchronization counters" STEERABLE=always
 {
 } no
 
@@ -28,21 +28,6 @@ STRING diagnostics_out_dir "Surface diagnostics output directory"
 BOOLEAN output_compatibility_diagnostics "Write documented 40-column compatibility files"
 {
 } no
-
-BOOLEAN export_spherical_surfaces "Export mapped converged surfaces through the optional SphericalSurface contract"
-{
-} no
-
-INT spherical_surface_index[256] "Fallback zero-based SphericalSurface target for this one-based compatibility slot"
-{
-  -1 :: "No fallback target"
-  0:* :: "Zero-based SphericalSurface index"
-} -1
-
-STRING spherical_surface_name[256] "Optional SphericalSurface name for this one-based compatibility slot"
-{
-  ".*" :: "Empty uses spherical_surface_index; non-empty resolves by name"
-} ""
 
 INT particle_out_every "Write synchronized parallel particle snapshots at this iteration cadence" STEERABLE=always
 {
@@ -89,12 +74,16 @@ KEYWORD angular_topology "Logical angular topology"
 
 KEYWORD logical_ownership "Logical surface ownership policy"
 {
-  "weighted_surface_owner" :: "One logical owner per surface; batch and balance surfaces across owners"
+  "weighted_surface_owner" :: "One logical owner per surface; prefer colocated mesh populations while bounding owner load"
 } "weighted_surface_owner"
 
 BOOLEAN enable_angular_continuation "Allocate persistent coarse-to-fine angular layers for initial acquisition and reacquisition"
 {
 } no
+
+BOOLEAN use_multilevel_tracking "Apply coarse-to-fine low-mode corrections during tracking while preserving the existing fine shape"
+{
+} yes
 
 INT angular_continuation_max_levels "Maximum persistent angular layers per physical surface, including the target layer"
 {
@@ -116,6 +105,11 @@ REAL angular_continuation_cutoff_threshold "Dimensionless high-angular-frequency
   0:* :: "Non-negative cutoff-content threshold"
 } 0.005
 
+REAL angular_continuation_helper_tolerance_factor "Residual-tolerance multiplier for non-target layers during established multilevel tracking; acquisition, reacquisition, and the published target layer always use the configured physical tolerance"
+{
+  1.0:* :: "At least the strict target tolerance"
+} 1000.0
+
 INT interpolation_order "Device tensor-product interpolation order"
 {
   1 :: "Trilinear bring-up and debugging"
@@ -131,6 +125,26 @@ BOOLEAN run_adm_gather_self_test "Validate the live native-centered gather again
 } no
 
 BOOLEAN run_angular_self_test "Validate the cell-centered spherical angular stencils"
+{
+} no
+
+BOOLEAN run_intrinsic_geometry_self_test "Validate polar-regular intrinsic geometry and scalar curvature on round and distorted surfaces"
+{
+} no
+
+BOOLEAN run_axial_symmetry_self_test "Validate the variational axial basis and projected device eigensolver"
+{
+} no
+
+BOOLEAN run_coordinate_flux_self_test "Validate finite-radius coordinate fluxes on the active AMReX backend"
+{
+} no
+
+BOOLEAN run_weyl_curvature_self_test "Validate native 3+1 Weyl curvature and horizon-tetrad projection on the active AMReX backend"
+{
+} no
+
+BOOLEAN run_four_dimensional_analysis_self_test "Validate four-metric, null-tetrad, Ricci/NP, and Weinberg algebra on the active AMReX backend"
 {
 } no
 
@@ -158,6 +172,55 @@ INT max_num_cells_moved "Maximum displacement in cells for bounded AMReX redistr
 BOOLEAN solve_surfaces "Run the GPU hyperbolic-relaxation solver for due surfaces"
 {
 } no
+
+BOOLEAN use_radial_geometry_cache "Sample frozen-slice ADM geometry along radial rays once per solver batch and interpolate it on the logical owner GPU"
+{
+} no
+
+INT radial_geometry_cache_nodes "Uniform radial samples per angular ray, including both interval endpoints"
+{
+  4:* :: "At least four nodes for cubic interpolation"
+} 128
+
+REAL radial_geometry_cache_half_width_factor "Half-width of each ray cache as a multiple of the surface birth radius"
+{
+  (0.0:* :: "Positive relative half-width"
+} 0.75
+
+REAL radial_geometry_cache_level_width_factor "Multiplier applied to the radial-cache half-width for each angular continuation level above the coarsest layer"
+{
+  (0.0:1.0 :: "Positive and no larger than the coarsest-layer width"
+} 1.0
+
+INT radial_geometry_cache_recenter_passes "Maximum narrow cache passes after authoritative direct validation reopens a cached terminal layer"
+{
+  0:* :: "Zero disables cache recentering"
+} 1
+
+REAL radial_geometry_cache_recenter_width_factor "Width of each recentered cache relative to the preceding cache interval"
+{
+  (0.0:1.0 :: "Positive and no larger than the preceding cache width"
+} 0.25
+
+REAL radial_geometry_cache_validation_tolerance "Maximum scaled ADM difference accepted against the direct gather at cache construction"
+{
+  (0.0:* :: "Positive scaled absolute tolerance"
+} 0.0001
+
+INT radial_geometry_cache_max_memory_mib "Maximum reusable radial-geometry payload per logical owner; oversized batches are split or use the direct path"
+{
+  1:* :: "Positive per-owner memory ceiling in MiB"
+} 512
+
+INT radial_geometry_cache_direct_step_reserve "Relaxation steps reserved for authoritative direct mesh sampling if a valid cache does not reach a terminal decision"
+{
+  0:* :: "Zero disables the reserve; otherwise fewer than maximum_relaxation_steps"
+} 1000
+
+INT radial_geometry_cache_convergence_interval "Cached pseudo-time steps between globally synchronized convergence decisions"
+{
+  1:* :: "Positive synchronization interval; one reproduces per-step decisions"
+} 8
 
 KEYWORD relaxation_integrator "Internal pseudo-time integration method"
 {
@@ -238,7 +301,7 @@ INT domain_exit_grace_searches "Consecutive synchronized due searches outside a 
   1:* :: "Positive number of withheld searches"
 } 2
 
-BOOLEAN enable_dynamic_common_horizons "Create provisional pairwise common-surface candidates at run time"
+BOOLEAN enable_dynamic_common_horizons "Create provisional common-surface candidates from disjoint tracked lineages at run time"
 {
 } no
 
@@ -262,7 +325,7 @@ INT maximum_active_candidates "Hard limit on simultaneous provisional common sur
   1:* :: "Positive active-candidate bound"
 } 64
 
-INT maximum_new_candidates_per_search "Hard limit on pairwise candidate births at one analysis point"
+INT maximum_new_candidates_per_search "Hard limit on common-surface candidate births at one analysis point"
 {
   1:* :: "Positive birth bound"
 } 8
@@ -348,8 +411,8 @@ BOOLEAN surface_enabled[256] "Enable this initially configured surface"
 KEYWORD initial_role[256] "Semantic role of this configured surface"
 {
   "individual" :: "An individual horizon eligible as a candidate parent"
-  "common" :: "A managed common-horizon seed excluded from pairwise parent selection"
-  "other" :: "A managed surface excluded from pairwise parent selection"
+  "common" :: "A managed common-horizon seed excluded from dynamic parent selection unless it has explicit generated ancestry"
+  "other" :: "A managed surface excluded from dynamic parent selection"
 } "individual"
 
 INT find_every_surface[256] "Per-surface search cadence; -1 uses find_every" STEERABLE=always

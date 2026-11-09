@@ -30,6 +30,25 @@ particle_seeds(const std::vector<SurfaceRecord> &surfaces);
 /// Balance complete logical surfaces across the currently available ranks.
 void assign_logical_owners(std::vector<SurfaceRecord> &surfaces);
 
+struct LogicalOwnerAssignmentStats {
+  amrex::Long colocated_particles = 0;
+  amrex::Long particle_count = 0;
+  amrex::Long maximum_owner_load = 0;
+};
+
+/** Assign each complete logical surface near its AMReX mesh population.
+ *
+ * This collective operation is valid only after a hierarchy-wide particle
+ * redistribution and before logical device storage is initialized. It also
+ * remaps decomposition-dependent owner metadata in every live particle and
+ * validates every angular-layer population.
+ */
+LogicalOwnerAssignmentStats assign_spatial_logical_owners(Runtime &state);
+
+/** Spatially place newly born surfaces without migrating existing owners. */
+LogicalOwnerAssignmentStats assign_new_spatial_logical_owners(
+    Runtime &state, const std::vector<amrex::Long> &new_surface_ids);
+
 /// Append one birth without moving any existing logical surface owner.
 void assign_new_logical_owner(SurfaceRecord &surface,
                               const std::vector<SurfaceRecord> &surfaces);
@@ -73,7 +92,10 @@ void update_surface_diagnostics(LogicalSurfaceStorage &logical_surfaces,
 void predict_surface_centers(const cGH *cctkGH, Runtime &state,
                              std::vector<amrex::Long> &due_surface_ids,
                              int iteration, amrex::Real time,
-                             amrex::Real maximum_extrapolation_intervals);
+                             amrex::Real maximum_extrapolation_intervals,
+                             int minimum_active_level,
+                             int maximum_active_level,
+                             bool complete_hierarchy);
 
 /// Conservative radial bound used by domain-exit preflight and its self-test.
 bool surface_fits_physical_domain(const SurfaceRecord &surface,

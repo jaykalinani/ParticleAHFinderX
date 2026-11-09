@@ -33,7 +33,7 @@ periodic_index(int index, const int period) noexcept {
   return index < 0 ? index + period : index;
 }
 
-/** Read a scalar through the two polar identifications of S^2. */
+/** Read a component through the two polar identifications of S^2. */
 AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE amrex::Real angular_scalar(
     const amrex::Real *const values, const amrex::Long offset,
     const int ntheta, const int nphi, int itheta, int iphi) noexcept {
@@ -46,6 +46,60 @@ AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE amrex::Real angular_scalar(
   }
   iphi = periodic_index(iphi, nphi);
   return values[offset + amrex::Long(itheta) * nphi + iphi];
+}
+
+/** Read an even or odd tensor component through the polar identification. */
+AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE amrex::Real angular_polar_component(
+    const amrex::Real *const values, const amrex::Long offset,
+    const int ntheta, const int nphi, int itheta, int iphi,
+    const int polar_parity) noexcept {
+  int sign = 1;
+  while (itheta < 0 || itheta >= ntheta) {
+    if (itheta < 0)
+      itheta = -itheta - 1;
+    else
+      itheta = 2 * ntheta - itheta - 1;
+    iphi += nphi / 2;
+    sign *= polar_parity;
+  }
+  iphi = periodic_index(iphi, nphi);
+  return sign * values[offset + amrex::Long(itheta) * nphi + iphi];
+}
+
+struct AngularFirstDerivatives {
+  amrex::Real theta = 0;
+  amrex::Real phi = 0;
+};
+
+AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE amrex::Real
+first_derivative_coefficient(int stencil) noexcept;
+
+/** First derivatives of a component with explicit polar parity. */
+AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE AngularFirstDerivatives
+angular_first_derivatives(const amrex::Real *const values,
+                          const amrex::Long offset, const int ntheta,
+                          const int nphi, const int itheta, const int iphi,
+                          const int polar_parity) noexcept {
+  const amrex::Real inverse_dtheta =
+      amrex::Real(ntheta) / amrex::Math::pi<amrex::Real>();
+  const amrex::Real inverse_dphi =
+      amrex::Real(nphi) / (2 * amrex::Math::pi<amrex::Real>());
+  AngularFirstDerivatives result;
+  for (int stencil = -3; stencil <= 3; ++stencil) {
+    const amrex::Real coefficient =
+        first_derivative_coefficient(stencil);
+    result.theta +=
+        coefficient * angular_polar_component(
+                          values, offset, ntheta, nphi, itheta + stencil,
+                          iphi, polar_parity);
+    result.phi +=
+        coefficient * angular_polar_component(
+                          values, offset, ntheta, nphi, itheta,
+                          iphi + stencil, polar_parity);
+  }
+  result.theta *= inverse_dtheta;
+  result.phi *= inverse_dphi;
+  return result;
 }
 
 AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE amrex::Real

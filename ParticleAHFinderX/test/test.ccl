@@ -16,6 +16,18 @@ TEST angular-self-test
 {
 }
 
+TEST coordinate-flux-self-test
+{
+}
+
+TEST weyl-curvature-self-test
+{
+}
+
+TEST four-dimensional-analysis-self-test
+{
+}
+
 TEST relaxation-self-test
 {
 }
@@ -25,5 +37,9 @@ TEST domain-exit-retirement
 }
 
 TEST dynamic-candidate-rejection
+{
+}
+
+TEST hierarchical-candidate-lifecycle
 {
 }

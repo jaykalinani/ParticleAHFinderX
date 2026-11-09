@@ -70,6 +70,13 @@ metric_dot(const amrex::Real metric[6], const amrex::Real lhs[3],
   return result;
 }
 
+AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE amrex::Real
+metric_determinant(const amrex::Real metric[6]) noexcept {
+  return metric[0] * (metric[3] * metric[5] - metric[4] * metric[4]) -
+         metric[1] * (metric[1] * metric[5] - metric[2] * metric[4]) +
+         metric[2] * (metric[1] * metric[4] - metric[2] * metric[3]);
+}
+
 AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE bool
 inverse_metric(const amrex::Real metric[6], amrex::Real inverse[3][3])
     noexcept {
@@ -79,9 +86,7 @@ inverse_metric(const amrex::Real metric[6], amrex::Real inverse[3][3])
   const amrex::Real d = metric[3];
   const amrex::Real e = metric[4];
   const amrex::Real f = metric[5];
-  const amrex::Real determinant =
-      a * (d * f - e * e) - b * (b * f - c * e) +
-      c * (b * e - c * d);
+  const amrex::Real determinant = metric_determinant(metric);
   if (!(determinant > 0) || !amrex::Math::isfinite(determinant))
     return false;
   const amrex::Real inverse_determinant = 1 / determinant;
@@ -98,7 +103,8 @@ AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE bool
 evaluate_expansion(const ExpansionInput &input, ExpansionOutput &output)
     noexcept {
   amrex::Real inverse[3][3];
-  if (!inverse_metric(input.gamma, inverse) || !(input.height > 0))
+  if (!inverse_metric(input.gamma, inverse) || !(input.height > 0) ||
+      !(input.dtheta > 0) || !(input.dphi > 0))
     return false;
 
   const AngularGeometry basis = angular_geometry(input.theta, input.phi);
@@ -230,9 +236,9 @@ evaluate_expansion(const ExpansionInput &input, ExpansionOutput &output)
       normal_curvature += output.normal[i] * curvature * output.normal[j];
     }
   output.theta = divergence + normal_curvature - trace_curvature;
-  output.area_weight = induced_determinant *
-                       amrex::Math::rsqrt(induced_determinant) *
-                       input.dtheta * input.dphi;
+  output.area_weight = surface_cell_area_weight(
+      induced_determinant * amrex::Math::rsqrt(induced_determinant),
+      input.dtheta, input.dphi);
   if (!amrex::Math::isfinite(output.theta) ||
       !amrex::Math::isfinite(output.area_weight))
     return false;

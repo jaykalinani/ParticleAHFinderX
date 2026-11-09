@@ -4,6 +4,7 @@
  */
 #include "angular_derivatives.hxx"
 #include "angular_geometry.hxx"
+#include "runtime.hxx"
 
 #include <cctk.h>
 #include <cctk_Arguments.h>
@@ -29,7 +30,8 @@ absolute_value(const amrex::Real value) noexcept {
 
 extern "C" void ParticleAHFinderX_AngularSelfTest(CCTK_ARGUMENTS) {
   DECLARE_CCTK_PARAMETERS;
-  if (!run_angular_self_test)
+  auto &state = runtime();
+  if (!run_angular_self_test || state.angular_self_test_complete)
     return;
 
   constexpr int test_ntheta = 32;
@@ -163,6 +165,7 @@ extern "C" void ParticleAHFinderX_AngularSelfTest(CCTK_ARGUMENTS) {
              "backend: maximum error=%.3g smooth/cutoff indicators=%.3g/%.3g",
              double(host_error), double(host_indicator[0]),
              double(host_indicator[1]));
+  state.angular_self_test_complete = true;
 }
 
 } // namespace ParticleAHFinderX

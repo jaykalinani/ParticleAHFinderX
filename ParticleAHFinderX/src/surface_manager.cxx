@@ -4,14 +4,19 @@
  */
 #include "surface_manager.hxx"
 
+#include "candidate_events.hxx"
+
 #include <cctk.h>
 
 #include <AMReX_Math.H>
 #include <AMReX_ParallelDescriptor.H>
 
+#include <mpi.h>
+
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <numeric>
 
 namespace ParticleAHFinderX {
 namespace {
@@ -251,6 +256,137 @@ bool surface_fits_physical_domain(
   return true;
 }
 
+namespace {
+
+struct SpatialSurfacePopulations {
+  std::vector<amrex::Long> rank_surface_counts;
+  std::vector<amrex::Long> surface_counts;
+};
+
+SpatialSurfacePopulations gather_spatial_surface_populations(
+    Runtime &state, const std::vector<std::size_t> &surface_indices) {
+  const int rank_count = amrex::ParallelDescriptor::NProcs();
+  if (surface_indices.empty())
+    return {};
+  if (surface_indices.size() >
+      static_cast<std::size_t>(std::numeric_limits<int>::max()))
+    amrex::Abort("ParticleAHFinderX live surface count exceeds the MPI count "
+                 "range");
+  if (static_cast<std::size_t>(rank_count) >
+      std::numeric_limits<std::size_t>::max() / surface_indices.size())
+    amrex::Abort("ParticleAHFinderX spatial ownership table size overflowed");
+
+  std::vector<SurfaceLevelRequest> requests;
+  requests.reserve(surface_indices.size());
+  for (const auto index : surface_indices) {
+    if (index >= state.surfaces.size() ||
+        state.surfaces[index].lifecycle == ParticleLifecycle::retired ||
+        state.surfaces[index].stable_id <= 0 ||
+        (!requests.empty() &&
+         requests.back().stable_id >= state.surfaces[index].stable_id))
+      amrex::Abort("ParticleAHFinderX spatial ownership surfaces must be "
+                   "live and ordered by stable ID");
+    requests.push_back({state.surfaces[index].stable_id, -1});
+  }
+
+  std::vector<amrex::Long> local_counts(surface_indices.size(), 0);
+  for (auto &container : state.containers) {
+    const auto local = container->local_surface_level_ranges(requests);
+    if (local.size() != local_counts.size())
+      amrex::Abort("ParticleAHFinderX received an invalid spatial ownership "
+                   "count table");
+    for (std::size_t surface = 0; surface < local.size(); ++surface) {
+      if (local[surface].stable_id != requests[surface].stable_id ||
+          local[surface].particle_count < 0 ||
+          local_counts[surface] >
+              std::numeric_limits<amrex::Long>::max() -
+                  local[surface].particle_count)
+        amrex::Abort("ParticleAHFinderX spatial ownership counts are "
+                     "inconsistent");
+      local_counts[surface] += local[surface].particle_count;
+    }
+  }
+
+  SpatialSurfacePopulations populations;
+  populations.rank_surface_counts.resize(
+      static_cast<std::size_t>(rank_count) * surface_indices.size(), 0);
+  const int surface_count = static_cast<int>(surface_indices.size());
+  const int mpi_error = MPI_Allgather(
+      local_counts.data(), surface_count,
+      amrex::ParallelDescriptor::Mpi_typemap<amrex::Long>::type(),
+      populations.rank_surface_counts.data(), surface_count,
+      amrex::ParallelDescriptor::Mpi_typemap<amrex::Long>::type(),
+      amrex::ParallelDescriptor::Communicator());
+  if (mpi_error != MPI_SUCCESS)
+    amrex::Abort("ParticleAHFinderX spatial ownership MPI_Allgather failed");
+
+  populations.surface_counts.assign(surface_indices.size(), 0);
+  for (std::size_t surface = 0; surface < surface_indices.size(); ++surface) {
+    for (int owner = 0; owner < rank_count; ++owner) {
+      const amrex::Long count =
+          populations.rank_surface_counts[
+              static_cast<std::size_t>(owner) * surface_indices.size() +
+              surface];
+      if (count < 0 ||
+          populations.surface_counts[surface] >
+              std::numeric_limits<amrex::Long>::max() - count)
+        amrex::Abort("ParticleAHFinderX spatial ownership particle count "
+                     "overflowed");
+      populations.surface_counts[surface] += count;
+    }
+    if (populations.surface_counts[surface] !=
+        total_angular_particle_count(state.surfaces[surface_indices[surface]]))
+      amrex::Abort("ParticleAHFinderX spatial ownership did not find every "
+                   "persistent surface particle");
+  }
+  return populations;
+}
+
+void remap_and_validate_logical_ownership(Runtime &state) {
+  const auto ownership = logical_ownership(state.surfaces);
+  std::vector<amrex::Long> layer_counts(ownership.size(), 0);
+  for (auto &container : state.containers) {
+    const auto local = container->remap_logical_ownership(ownership);
+    if (local.size() != layer_counts.size())
+      amrex::Abort("ParticleAHFinderX logical ownership remap returned an "
+                   "invalid count table");
+    for (std::size_t layer = 0; layer < local.size(); ++layer) {
+      if (local[layer] < 0 ||
+          layer_counts[layer] >
+              std::numeric_limits<amrex::Long>::max() - local[layer])
+        amrex::Abort("ParticleAHFinderX logical ownership layer count "
+                     "overflowed");
+      layer_counts[layer] += local[layer];
+    }
+  }
+  if (layer_counts.size() >
+      static_cast<std::size_t>(std::numeric_limits<int>::max()))
+    amrex::Abort("ParticleAHFinderX logical ownership layer count exceeds "
+                 "the MPI count range");
+  if (!layer_counts.empty())
+    amrex::ParallelDescriptor::ReduceLongSum(
+        layer_counts.data(), static_cast<int>(layer_counts.size()));
+  for (std::size_t layer = 0; layer < ownership.size(); ++layer) {
+    const auto found = std::lower_bound(
+        state.surfaces.begin(), state.surfaces.end(),
+        ownership[layer].surface_id,
+        [](const SurfaceRecord &candidate, const amrex::Long stable_id) {
+          return candidate.stable_id < stable_id;
+        });
+    if (found == state.surfaces.end() ||
+        found->stable_id != ownership[layer].surface_id ||
+        ownership[layer].angular_level < 0 ||
+        ownership[layer].angular_level >= found->angular_levels ||
+        layer_counts[layer] !=
+            found->angular_layer[ownership[layer].angular_level]
+                .particle_count)
+      amrex::Abort("ParticleAHFinderX logical ownership remap corrupted a "
+                   "persistent angular layer");
+  }
+}
+
+} // namespace
+
 void assign_logical_owners(std::vector<SurfaceRecord> &surfaces) {
   const int num_owners = amrex::ParallelDescriptor::NProcs();
   if (num_owners <= 0)
@@ -280,6 +416,246 @@ void assign_logical_owners(std::vector<SurfaceRecord> &surfaces) {
             .logical_owner_offset;
     load[owner] += count;
   }
+}
+
+LogicalOwnerAssignmentStats assign_spatial_logical_owners(Runtime &state) {
+  const int rank_count = amrex::ParallelDescriptor::NProcs();
+  if (rank_count <= 0)
+    amrex::Abort("ParticleAHFinderX found no logical surface owners");
+
+  std::vector<std::size_t> live_surfaces;
+  live_surfaces.reserve(state.surfaces.size());
+  for (std::size_t index = 0; index < state.surfaces.size(); ++index) {
+    auto &surface = state.surfaces[index];
+    if (surface.lifecycle == ParticleLifecycle::retired) {
+      surface.logical_owner_rank = -1;
+      surface.logical_owner_offset = -1;
+      continue;
+    }
+    if (surface.stable_id <= 0 ||
+        (!live_surfaces.empty() &&
+         state.surfaces[live_surfaces.back()].stable_id >= surface.stable_id))
+      amrex::Abort("ParticleAHFinderX live surfaces are not ordered by stable "
+                   "ID during logical ownership assignment");
+    live_surfaces.push_back(index);
+  }
+
+  LogicalOwnerAssignmentStats stats;
+  if (live_surfaces.empty()) {
+    rebuild_logical_offsets(state.surfaces);
+    return stats;
+  }
+  const auto populations =
+      gather_spatial_surface_populations(state, live_surfaces);
+  const auto &surface_particles = populations.surface_counts;
+  const auto &rank_surface_counts = populations.rank_surface_counts;
+  for (std::size_t surface = 0; surface < live_surfaces.size(); ++surface) {
+    if (stats.particle_count >
+        std::numeric_limits<amrex::Long>::max() -
+            surface_particles[surface])
+      amrex::Abort("ParticleAHFinderX spatial ownership total overflowed");
+    stats.particle_count += surface_particles[surface];
+  }
+
+  std::vector<std::size_t> assignment_order(live_surfaces.size());
+  std::iota(assignment_order.begin(), assignment_order.end(), 0);
+  std::sort(assignment_order.begin(), assignment_order.end(),
+            [&](const std::size_t first, const std::size_t second) {
+              if (surface_particles[first] != surface_particles[second])
+                return surface_particles[first] > surface_particles[second];
+              return state.surfaces[live_surfaces[first]].stable_id <
+                     state.surfaces[live_surfaces[second]].stable_id;
+            });
+
+  std::vector<amrex::Long> owner_load(rank_count, 0);
+  for (const std::size_t surface : assignment_order) {
+    const amrex::Long count = surface_particles[surface];
+    int selected_owner = -1;
+    amrex::Long selected_score = 0;
+    for (int owner = 0; owner < rank_count; ++owner) {
+      const amrex::Long local =
+          rank_surface_counts[static_cast<std::size_t>(owner) *
+                                  live_surfaces.size() +
+                              surface];
+      if (local < 0 || local > count)
+        amrex::Abort("ParticleAHFinderX spatial ownership found an invalid "
+                     "rank-local population");
+      const amrex::Long remote = count - local;
+      if (remote >
+          (std::numeric_limits<amrex::Long>::max() - owner_load[owner]) /
+              rank_count)
+        amrex::Abort("ParticleAHFinderX spatial ownership score overflowed");
+      const amrex::Long score =
+          remote * static_cast<amrex::Long>(rank_count) + owner_load[owner];
+      if (selected_owner < 0 || score < selected_score ||
+          (score == selected_score &&
+           (owner_load[owner] < owner_load[selected_owner] ||
+            (owner_load[owner] == owner_load[selected_owner] &&
+             owner < selected_owner)))) {
+        selected_owner = owner;
+        selected_score = score;
+      }
+    }
+    if (owner_load[selected_owner] >
+        std::numeric_limits<amrex::Long>::max() - count)
+      amrex::Abort("ParticleAHFinderX spatial logical-owner load overflowed");
+    state.surfaces[live_surfaces[surface]].logical_owner_rank =
+        selected_owner;
+    owner_load[selected_owner] += count;
+    stats.colocated_particles +=
+        rank_surface_counts[static_cast<std::size_t>(selected_owner) *
+                                live_surfaces.size() +
+                            surface];
+  }
+  stats.maximum_owner_load =
+      *std::max_element(owner_load.begin(), owner_load.end());
+  rebuild_logical_offsets(state.surfaces);
+  remap_and_validate_logical_ownership(state);
+  return stats;
+}
+
+LogicalOwnerAssignmentStats assign_new_spatial_logical_owners(
+    Runtime &state, const std::vector<amrex::Long> &new_surface_ids) {
+  const int rank_count = amrex::ParallelDescriptor::NProcs();
+  if (rank_count <= 0)
+    amrex::Abort("ParticleAHFinderX found no logical surface owners");
+  LogicalOwnerAssignmentStats stats;
+  if (new_surface_ids.empty())
+    return stats;
+
+  std::vector<std::size_t> new_surfaces;
+  new_surfaces.reserve(new_surface_ids.size());
+  for (std::size_t index = 0; index < new_surface_ids.size(); ++index) {
+    if (new_surface_ids[index] <= 0 ||
+        (index > 0 &&
+         new_surface_ids[index - 1] >= new_surface_ids[index]))
+      amrex::Abort("ParticleAHFinderX new spatial owner IDs must be unique "
+                   "and ordered");
+    const auto found = std::lower_bound(
+        state.surfaces.begin(), state.surfaces.end(), new_surface_ids[index],
+        [](const SurfaceRecord &surface, const amrex::Long stable_id) {
+          return surface.stable_id < stable_id;
+        });
+    if (found == state.surfaces.end() ||
+        found->stable_id != new_surface_ids[index] ||
+        found->lifecycle == ParticleLifecycle::retired)
+      amrex::Abort("ParticleAHFinderX new spatial owner ID is not a live "
+                   "surface");
+    new_surfaces.push_back(
+        static_cast<std::size_t>(found - state.surfaces.begin()));
+  }
+
+  struct PreservedOwnerLayout {
+    std::size_t surface_index = 0;
+    int owner_rank = -1;
+    std::array<amrex::Long, max_angular_layers> layer_offsets{};
+  };
+  std::vector<PreservedOwnerLayout> preserved;
+  std::vector<amrex::Long> owner_load(rank_count, 0);
+  for (std::size_t index = 0; index < state.surfaces.size(); ++index) {
+    const auto &surface = state.surfaces[index];
+    if (surface.lifecycle == ParticleLifecycle::retired ||
+        std::binary_search(new_surface_ids.begin(), new_surface_ids.end(),
+                           surface.stable_id))
+      continue;
+    if (surface.logical_owner_rank < 0 ||
+        surface.logical_owner_rank >= rank_count)
+      amrex::Abort("ParticleAHFinderX existing logical owner is invalid at "
+                   "dynamic birth");
+    PreservedOwnerLayout layout;
+    layout.surface_index = index;
+    layout.owner_rank = surface.logical_owner_rank;
+    for (int level = 0; level < surface.angular_levels; ++level)
+      layout.layer_offsets[level] =
+          surface.angular_layer[level].logical_owner_offset;
+    preserved.push_back(layout);
+
+    const amrex::Long begin =
+        surface.angular_layer[0].logical_owner_offset;
+    const amrex::Long count = total_angular_particle_count(surface);
+    if (begin < 0 ||
+        begin > std::numeric_limits<amrex::Long>::max() - count)
+      amrex::Abort("ParticleAHFinderX existing logical owner load overflowed "
+                   "at dynamic birth");
+    owner_load[surface.logical_owner_rank] =
+        amrex::max(owner_load[surface.logical_owner_rank], begin + count);
+  }
+
+  const auto populations =
+      gather_spatial_surface_populations(state, new_surfaces);
+  std::vector<std::size_t> assignment_order(new_surfaces.size());
+  std::iota(assignment_order.begin(), assignment_order.end(), 0);
+  std::sort(assignment_order.begin(), assignment_order.end(),
+            [&](const std::size_t first, const std::size_t second) {
+              if (populations.surface_counts[first] !=
+                  populations.surface_counts[second])
+                return populations.surface_counts[first] >
+                       populations.surface_counts[second];
+              return state.surfaces[new_surfaces[first]].stable_id <
+                     state.surfaces[new_surfaces[second]].stable_id;
+            });
+
+  for (const std::size_t surface : assignment_order) {
+    const amrex::Long count = populations.surface_counts[surface];
+    if (stats.particle_count >
+        std::numeric_limits<amrex::Long>::max() - count)
+      amrex::Abort("ParticleAHFinderX dynamic spatial ownership total "
+                   "overflowed");
+    stats.particle_count += count;
+    int selected_owner = -1;
+    amrex::Long selected_score = 0;
+    for (int owner = 0; owner < rank_count; ++owner) {
+      const amrex::Long local =
+          populations.rank_surface_counts[
+              static_cast<std::size_t>(owner) * new_surfaces.size() +
+              surface];
+      if (local < 0 || local > count)
+        amrex::Abort("ParticleAHFinderX dynamic spatial ownership found an "
+                     "invalid rank-local population");
+      const amrex::Long remote = count - local;
+      if (remote >
+          (std::numeric_limits<amrex::Long>::max() - owner_load[owner]) /
+              rank_count)
+        amrex::Abort("ParticleAHFinderX dynamic spatial ownership score "
+                     "overflowed");
+      const amrex::Long score =
+          remote * static_cast<amrex::Long>(rank_count) + owner_load[owner];
+      if (selected_owner < 0 || score < selected_score ||
+          (score == selected_score &&
+           (owner_load[owner] < owner_load[selected_owner] ||
+            (owner_load[owner] == owner_load[selected_owner] &&
+             owner < selected_owner)))) {
+        selected_owner = owner;
+        selected_score = score;
+      }
+    }
+    if (owner_load[selected_owner] >
+        std::numeric_limits<amrex::Long>::max() - count)
+      amrex::Abort("ParticleAHFinderX dynamic spatial owner load overflowed");
+    state.surfaces[new_surfaces[surface]].logical_owner_rank = selected_owner;
+    owner_load[selected_owner] += count;
+    stats.colocated_particles +=
+        populations.rank_surface_counts[
+            static_cast<std::size_t>(selected_owner) * new_surfaces.size() +
+            surface];
+  }
+  stats.maximum_owner_load =
+      *std::max_element(owner_load.begin(), owner_load.end());
+
+  rebuild_logical_offsets(state.surfaces);
+  for (const auto &layout : preserved) {
+    const auto &surface = state.surfaces[layout.surface_index];
+    if (surface.logical_owner_rank != layout.owner_rank)
+      amrex::Abort("ParticleAHFinderX dynamic birth migrated an existing "
+                   "logical owner");
+    for (int level = 0; level < surface.angular_levels; ++level)
+      if (surface.angular_layer[level].logical_owner_offset !=
+          layout.layer_offsets[level])
+        amrex::Abort("ParticleAHFinderX dynamic birth changed an existing "
+                     "logical owner offset");
+  }
+  remap_and_validate_logical_ownership(state);
+  return stats;
 }
 
 void assign_new_logical_owner(
@@ -683,7 +1059,9 @@ void predict_surface_centers(
     const cGH *const cctkGH, Runtime &state,
     std::vector<amrex::Long> &due_surface_ids, const int iteration,
     const amrex::Real time,
-    const amrex::Real maximum_extrapolation_intervals) {
+    const amrex::Real maximum_extrapolation_intervals,
+    const int minimum_active_level, const int maximum_active_level,
+    const bool complete_hierarchy) {
   DECLARE_CCTK_PARAMETERS;
   if (due_surface_ids.empty())
     return;
@@ -695,6 +1073,7 @@ void predict_surface_centers(
   std::vector<SurfaceCenterUpdate> updates;
   std::vector<amrex::Long> ready_surface_ids;
   std::vector<amrex::Long> retire_ids;
+  std::vector<amrex::Long> candidate_domain_retire_ids;
   updates.reserve(due_surface_ids.size());
   ready_surface_ids.reserve(due_surface_ids.size());
   for (auto &surface : state.surfaces) {
@@ -770,6 +1149,15 @@ void predict_surface_centers(
 
     if (retire_on_domain_exit &&
         !surface_fits_physical_domain(surface, target, domain)) {
+      if (!complete_hierarchy) {
+        if (verbose)
+          CCTK_VINFO("Withholding surface %lld because its proposed radial "
+                     "bound does not fit the partial active level band; "
+                     "domain-exit lifecycle checks wait for complete "
+                     "hierarchy synchronization",
+                     static_cast<long long>(surface.stable_id));
+        continue;
+      }
       if (surface.last_domain_exit_check_iteration != iteration) {
         if (surface.consecutive_domain_exit_checks ==
             std::numeric_limits<int>::max())
@@ -789,6 +1177,9 @@ void predict_surface_centers(
           domain_exit_grace_searches) {
         surface.retired_outside_domain = true;
         retire_ids.push_back(surface.stable_id);
+        if (surface.lifecycle == ParticleLifecycle::candidate &&
+            surface.role == SurfaceRole::common)
+          candidate_domain_retire_ids.push_back(surface.stable_id);
       }
       continue;
     }
@@ -809,18 +1200,122 @@ void predict_surface_centers(
     if (displacement_squared <= threshold * threshold)
       continue;
     updates.push_back({surface.stable_id, surface.center, target});
-    surface.center = target;
+  }
+
+  if (!complete_hierarchy && !updates.empty()) {
+    std::vector<amrex::Long> translation_stats(2 * updates.size(), 0);
+    for (const auto &container : state.containers) {
+      const auto local = container->local_active_band_translation_stats(
+          updates, minimum_active_level, maximum_active_level);
+      if (local.size() != updates.size())
+        CCTK_ERROR("ParticleAHFinderX active-band translation preflight "
+                   "returned an inconsistent result size");
+      for (std::size_t index = 0; index < updates.size(); ++index) {
+        if (local[index].stable_id != updates[index].surface_id)
+          CCTK_ERROR("ParticleAHFinderX active-band translation preflight "
+                     "returned an inconsistent surface ID");
+        translation_stats[2 * index] += local[index].particle_count;
+        translation_stats[2 * index + 1] +=
+            local[index].outside_active_band;
+      }
+    }
+    amrex::ParallelDescriptor::ReduceLongSum(
+        translation_stats.data(), static_cast<int>(translation_stats.size()));
+
+    std::vector<SurfaceCenterUpdate> accepted_updates;
+    std::vector<amrex::Long> deferred_ids;
+    accepted_updates.reserve(updates.size());
+    deferred_ids.reserve(updates.size());
+    for (std::size_t index = 0; index < updates.size(); ++index) {
+      const auto found = std::lower_bound(
+          state.surfaces.begin(), state.surfaces.end(),
+          updates[index].surface_id,
+          [](const SurfaceRecord &surface, const amrex::Long stable_id) {
+            return surface.stable_id < stable_id;
+          });
+      if (found == state.surfaces.end() ||
+          found->stable_id != updates[index].surface_id)
+        CCTK_ERROR("ParticleAHFinderX active-band translation preflight lost "
+                   "surface metadata");
+      const amrex::Long expected = total_angular_particle_count(*found);
+      const amrex::Long in_band = translation_stats[2 * index];
+      const amrex::Long outside_after_translation =
+          translation_stats[2 * index + 1];
+      if (in_band > expected || outside_after_translation > in_band)
+        CCTK_VERROR(
+            "ParticleAHFinderX active-band translation preflight counted "
+            "an invalid population for surface %lld: in_band=%lld "
+            "outside_after_translation=%lld expected=%lld",
+            static_cast<long long>(updates[index].surface_id),
+            static_cast<long long>(in_band),
+            static_cast<long long>(outside_after_translation),
+            static_cast<long long>(expected));
+      if (in_band != expected || outside_after_translation != 0) {
+        deferred_ids.push_back(updates[index].surface_id);
+        if (verbose)
+          CCTK_VINFO(
+              "Withholding surface %lld because translating its persistent "
+              "population requires %lld inactive point(s) and would move "
+              "%lld active point(s) outside level band=[%d,%d)",
+              static_cast<long long>(updates[index].surface_id),
+              static_cast<long long>(expected - in_band),
+              static_cast<long long>(outside_after_translation),
+              minimum_active_level, maximum_active_level);
+      } else {
+        accepted_updates.push_back(updates[index]);
+      }
+    }
+    if (!deferred_ids.empty())
+      ready_surface_ids.erase(
+          std::remove_if(ready_surface_ids.begin(), ready_surface_ids.end(),
+                         [&](const amrex::Long stable_id) {
+                           return std::binary_search(deferred_ids.begin(),
+                                                     deferred_ids.end(),
+                                                     stable_id);
+                         }),
+          ready_surface_ids.end());
+    updates.swap(accepted_updates);
   }
 
   if (!updates.empty()) {
+    for (const auto &update : updates) {
+      const auto found = std::lower_bound(
+          state.surfaces.begin(), state.surfaces.end(), update.surface_id,
+          [](const SurfaceRecord &surface, const amrex::Long stable_id) {
+            return surface.stable_id < stable_id;
+          });
+      if (found == state.surfaces.end() ||
+          found->stable_id != update.surface_id)
+        CCTK_ERROR("ParticleAHFinderX center update lost surface metadata");
+      found->center = update.new_center;
+    }
     state.logical_surfaces->update_surface_centers(updates);
     for (auto &container : state.containers) {
       container->update_surface_centers(updates);
-      container->redistribute_global();
+      if (complete_hierarchy)
+        container->redistribute_global();
+      else
+        container->redistribute_active_band(minimum_active_level,
+                                            maximum_active_level, 0);
     }
   }
-  if (!retire_ids.empty())
+  if (!retire_ids.empty()) {
     retire_surface_populations(state, retire_ids);
+    for (const auto stable_id : candidate_domain_retire_ids) {
+      const auto found = std::lower_bound(
+          state.surfaces.begin(), state.surfaces.end(), stable_id,
+          [](const SurfaceRecord &surface, const amrex::Long id) {
+            return surface.stable_id < id;
+          });
+      if (found == state.surfaces.end() || found->stable_id != stable_id)
+        CCTK_ERROR("ParticleAHFinderX lost domain-retired candidate "
+                   "metadata");
+      append_candidate_event(state, *found,
+                             CandidateEventType::retirement,
+                             CandidateEventReason::outside_domain,
+                             iteration, time);
+    }
+  }
   due_surface_ids.swap(ready_surface_ids);
 }
 

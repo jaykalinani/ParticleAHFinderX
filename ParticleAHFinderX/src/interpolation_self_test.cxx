@@ -3,6 +3,7 @@
  * \brief Optional accelerator test of interpolation values and derivatives.
  */
 #include "interpolation.hxx"
+#include "runtime.hxx"
 
 #include <cctk.h>
 #include <cctk_Arguments.h>
@@ -22,6 +23,7 @@ namespace ParticleAHFinderX {
 namespace {
 
 constexpr int num_test_points = 16;
+constexpr int num_radial_test_points = 19;
 
 AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE amrex::Real
 linear_polynomial(const amrex::Real x, const amrex::Real y,
@@ -49,14 +51,117 @@ cubic_gradient(const amrex::Real x, const amrex::Real y,
                x * y / 200}};
 }
 
+AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE amrex::GpuArray<amrex::Real, 6>
+cubic_hessian(const amrex::Real x, const amrex::Real y,
+              const amrex::Real z) noexcept {
+  return {{amrex::Real(1) / 5 + 3 * x / 50,
+           amrex::Real(3) / 100 + z / 200,
+           amrex::Real(1) / 25 + y / 200,
+           -amrex::Real(2) / 5 - 9 * y / 100,
+           -amrex::Real(1) / 50 + x / 200,
+           amrex::Real(1) / 10 + 3 * z / 25}};
+}
+
 AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE amrex::GpuArray<amrex::Real, 3>
 linear_gradient() noexcept {
   return {{2, -3, amrex::Real(1) / 2}};
 }
 
+AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE amrex::Real
+radial_polynomial(const amrex::Real radius) noexcept {
+  return amrex::Real(3) / 5 - amrex::Real(7) * radius / 11 +
+         amrex::Real(2) * radius * radius / 9 -
+         radius * radius * radius / 13;
+}
+
+void test_radial_interpolation(amrex::Real &maximum_value_error) {
+  constexpr int radial_nodes = 11;
+  constexpr int components = 3;
+  constexpr int node_stride = 5;
+  const amrex::Real lower_radius = amrex::Real(0.13);
+  const amrex::Real upper_radius = amrex::Real(1.37);
+  amrex::Gpu::DeviceVector<amrex::Real> samples(
+      components * radial_nodes * node_stride);
+  amrex::Real *const sample = samples.dataPtr();
+  amrex::ParallelFor(
+      components * radial_nodes * node_stride,
+      [=] AMREX_GPU_DEVICE(const int index) noexcept {
+        const int component = index / (radial_nodes * node_stride);
+        const int component_index =
+            index - component * radial_nodes * node_stride;
+        const int node = component_index / node_stride;
+        const int lane = component_index - node * node_stride;
+        const amrex::Real radius =
+            lower_radius + (upper_radius - lower_radius) * node /
+                               (radial_nodes - 1);
+        sample[index] = (component + 1) * radial_polynomial(radius) +
+                        amrex::Real(component) / 17 +
+                        amrex::Real(lane) / 23;
+      });
+
+  amrex::Gpu::DeviceVector<amrex::Real> results(
+      components * num_radial_test_points);
+  amrex::Gpu::DeviceVector<int> status(
+      components * num_radial_test_points + 2);
+  amrex::Real *const result = results.dataPtr();
+  int *const valid = status.dataPtr();
+  amrex::ParallelFor(
+      components * num_radial_test_points,
+      [=] AMREX_GPU_DEVICE(const int index) noexcept {
+        const int component = index / num_radial_test_points;
+        const int point = index - component * num_radial_test_points;
+        const int lane = component + 1;
+        const amrex::Real radius =
+            lower_radius + (upper_radius - lower_radius) * point /
+                               (num_radial_test_points - 1);
+        valid[index] = radial_cubic_interpolate(
+            sample + component * radial_nodes * node_stride + lane,
+            node_stride, radial_nodes, lower_radius, upper_radius, radius,
+            result[index]);
+      });
+  amrex::ParallelFor(2, [=] AMREX_GPU_DEVICE(const int side) noexcept {
+    const amrex::Real radius =
+        side == 0 ? lower_radius - amrex::Real(1.0e-3)
+                  : upper_radius + amrex::Real(1.0e-3);
+    amrex::Real ignored = 0;
+    valid[components * num_radial_test_points + side] =
+        radial_cubic_interpolate(sample, node_stride, radial_nodes,
+                                 lower_radius, upper_radius, radius, ignored);
+  });
+
+  std::vector<amrex::Real> host_results(results.size());
+  std::vector<int> host_status(status.size());
+  amrex::Gpu::copy(amrex::Gpu::deviceToHost, results.begin(), results.end(),
+                   host_results.begin());
+  amrex::Gpu::copy(amrex::Gpu::deviceToHost, status.begin(), status.end(),
+                   host_status.begin());
+  amrex::Gpu::streamSynchronize();
+  for (int component = 0; component < components; ++component)
+    for (int point = 0; point < num_radial_test_points; ++point) {
+      const int index = component * num_radial_test_points + point;
+      if (!host_status[index])
+        CCTK_ERROR("ParticleAHFinderX radial interpolation self-test "
+                   "rejected an in-range sample");
+      const amrex::Real radius =
+          lower_radius + (upper_radius - lower_radius) * point /
+                             (num_radial_test_points - 1);
+      const amrex::Real expected =
+          (component + 1) * radial_polynomial(radius) +
+          amrex::Real(component) / 17 + amrex::Real(component + 1) / 23;
+      maximum_value_error =
+          std::max(maximum_value_error,
+                   std::abs(host_results[index] - expected));
+    }
+  if (host_status[components * num_radial_test_points] ||
+      host_status[components * num_radial_test_points + 1])
+    CCTK_ERROR("ParticleAHFinderX radial interpolation self-test silently "
+               "extrapolated beyond the cached interval");
+}
+
 void test_centering(const FieldCentering centering, const bool cubic,
                     amrex::Real &maximum_value_error,
-                    amrex::Real &maximum_gradient_error) {
+                    amrex::Real &maximum_gradient_error,
+                    amrex::Real &maximum_hessian_error) {
   const amrex::Box box(amrex::IntVect(0, 0, 0), amrex::IntVect(7, 7, 7));
   const amrex::GpuArray<amrex::Real, 3> prob_lo{{-1, -1, -1}};
   const amrex::GpuArray<amrex::Real, 3> dx{{amrex::Real(1) / 4,
@@ -113,12 +218,17 @@ void test_centering(const FieldCentering centering, const bool cubic,
   amrex::Gpu::DeviceVector<amrex::Real> device_adm_result(
       30 * num_test_points);
   amrex::Gpu::DeviceVector<int> device_adm_status(num_test_points);
+  amrex::Gpu::DeviceVector<amrex::Real> device_curvature_result(
+      54 * num_test_points);
+  amrex::Gpu::DeviceVector<int> device_curvature_status(num_test_points);
   const amrex::Array4<const amrex::Real> const_field(field);
   const amrex::Real *const position = device_position.dataPtr();
   amrex::Real *const result = device_result.dataPtr();
   int *const success = device_success.dataPtr();
   amrex::Real *const adm_result = device_adm_result.dataPtr();
   int *const adm_status = device_adm_status.dataPtr();
+  amrex::Real *const curvature_result = device_curvature_result.dataPtr();
+  int *const curvature_status = device_curvature_status.dataPtr();
   amrex::ParallelFor(
       num_test_points,
       [=] AMREX_GPU_DEVICE(const int point) noexcept {
@@ -155,12 +265,32 @@ void test_centering(const FieldCentering centering, const bool cubic,
                 adm.d_gamma[d][component];
           adm_result[30 * point + 24 + component] = adm.curv[component];
         }
+        if (cubic) {
+          CurvatureDerivativeData derivatives;
+          curvature_status[point] = static_cast<int>(
+              tensor_cubic_interpolate_curvature_derivatives(
+                  const_field, 0, const_field, 6, sample_position, prob_lo,
+                  inv_dx, centering, box, box, derivatives));
+          for (int pair = 0; pair < 6; ++pair)
+            for (int component = 0; component < 6; ++component)
+              curvature_result[54 * point + 6 * pair + component] =
+                  derivatives.dd_gamma[pair][component];
+          for (int d = 0; d < 3; ++d)
+            for (int component = 0; component < 6; ++component)
+              curvature_result[54 * point + 36 + 6 * d + component] =
+                  derivatives.d_curv[d][component];
+        } else {
+          curvature_status[point] =
+              static_cast<int>(InterpolationStatus::success);
+        }
       });
 
   std::vector<amrex::Real> host_result(4 * num_test_points);
   std::vector<int> host_success(num_test_points);
   std::vector<amrex::Real> host_adm_result(30 * num_test_points);
   std::vector<int> host_adm_status(num_test_points);
+  std::vector<amrex::Real> host_curvature_result(54 * num_test_points);
+  std::vector<int> host_curvature_status(num_test_points);
   amrex::Gpu::copy(amrex::Gpu::deviceToHost, device_result.begin(),
                    device_result.end(), host_result.begin());
   amrex::Gpu::copy(amrex::Gpu::deviceToHost, device_success.begin(),
@@ -169,6 +299,14 @@ void test_centering(const FieldCentering centering, const bool cubic,
                    device_adm_result.end(), host_adm_result.begin());
   amrex::Gpu::copy(amrex::Gpu::deviceToHost, device_adm_status.begin(),
                    device_adm_status.end(), host_adm_status.begin());
+  amrex::Gpu::copy(amrex::Gpu::deviceToHost,
+                   device_curvature_result.begin(),
+                   device_curvature_result.end(),
+                   host_curvature_result.begin());
+  amrex::Gpu::copy(amrex::Gpu::deviceToHost,
+                   device_curvature_status.begin(),
+                   device_curvature_status.end(),
+                   host_curvature_status.begin());
   amrex::Gpu::streamSynchronize();
 
   for (int point = 0; point < num_test_points; ++point) {
@@ -185,6 +323,7 @@ void test_centering(const FieldCentering centering, const bool cubic,
                  std::abs(host_result[4 * point] - expected));
     const auto expected_gradient =
         cubic ? cubic_gradient(x, y, z) : linear_gradient();
+    const auto expected_hessian = cubic_hessian(x, y, z);
     if (cubic)
       for (int d = 0; d < 3; ++d)
         maximum_gradient_error =
@@ -211,6 +350,24 @@ void test_centering(const FieldCentering centering, const bool cubic,
             maximum_gradient_error,
             std::abs(host_adm_result[30 * point + 6 + 6 * d + component] -
                      scale * expected_gradient[d]));
+      if (cubic) {
+        if (host_curvature_status[point] !=
+            static_cast<int>(InterpolationStatus::success))
+          CCTK_ERROR("ParticleAHFinderX curvature-derivative interpolation "
+                     "self-test missed an available stencil");
+        for (int pair = 0; pair < 6; ++pair)
+          maximum_hessian_error = std::max(
+              maximum_hessian_error,
+              std::abs(host_curvature_result[54 * point + 6 * pair +
+                                             component] -
+                       scale * expected_hessian[pair]));
+        for (int d = 0; d < 3; ++d)
+          maximum_gradient_error = std::max(
+              maximum_gradient_error,
+              std::abs(host_curvature_result[54 * point + 36 + 6 * d +
+                                             component] +
+                       scale * expected_gradient[d] / 2));
+      }
     }
   }
 
@@ -249,29 +406,37 @@ void test_centering(const FieldCentering centering, const bool cubic,
 
 extern "C" void ParticleAHFinderX_InterpolationSelfTest(CCTK_ARGUMENTS) {
   DECLARE_CCTK_PARAMETERS;
-  if (!run_interpolation_self_test)
+  auto &state = runtime();
+  if (!run_interpolation_self_test ||
+      state.interpolation_self_test_complete)
     return;
 
   amrex::Real maximum_value_error = 0;
   amrex::Real maximum_gradient_error = 0;
+  amrex::Real maximum_hessian_error = 0;
   for (const int nodal : {0, 1}) {
     const FieldCentering centering{{{nodal, nodal, nodal}}};
     test_centering(centering, false, maximum_value_error,
-                   maximum_gradient_error);
+                   maximum_gradient_error, maximum_hessian_error);
     test_centering(centering, true, maximum_value_error,
-                   maximum_gradient_error);
+                   maximum_gradient_error, maximum_hessian_error);
   }
+  test_radial_interpolation(maximum_value_error);
   const amrex::Real tolerance =
       5000 * std::numeric_limits<amrex::Real>::epsilon();
   if (maximum_value_error > tolerance ||
-      maximum_gradient_error > tolerance)
+      maximum_gradient_error > tolerance ||
+      maximum_hessian_error > tolerance)
     CCTK_VERROR("ParticleAHFinderX interpolation self-test failed: value "
-                "error=%.17g gradient error=%.17g tolerance=%.17g",
+                "error=%.17g gradient error=%.17g Hessian error=%.17g "
+                "tolerance=%.17g",
                 double(maximum_value_error), double(maximum_gradient_error),
-                double(tolerance));
+                double(maximum_hessian_error), double(tolerance));
   CCTK_VINFO("Interpolation self-test passed on the active AMReX backend: "
-             "value error=%.3g gradient error=%.3g",
-             double(maximum_value_error), double(maximum_gradient_error));
+             "value error=%.3g gradient error=%.3g Hessian error=%.3g",
+             double(maximum_value_error), double(maximum_gradient_error),
+             double(maximum_hessian_error));
+  state.interpolation_self_test_complete = true;
 }
 
 } // namespace ParticleAHFinderX

@@ -7,6 +7,7 @@
  * pseudo-time solve on a frozen physical slice and does not participate in
  * the physical evolution integrator's stage schedule.
  */
+#include "analysis_api.hxx"
 #include "runtime.hxx"
 #include "candidate_manager.hxx"
 #include "surface_manager.hxx"
@@ -23,6 +24,13 @@
 #include <AMReX_ParallelDescriptor.H>
 #include <AMReX_REAL.H>
 #include <AMReX_Utility.H>
+
+#ifdef AMREX_USE_MPI
+#include <mpi.h>
+#ifdef OPEN_MPI
+#include <mpi-ext.h>
+#endif
+#endif
 
 #include <algorithm>
 #include <array>
@@ -46,6 +54,50 @@ static_assert(sizeof(CCTK_REAL) == sizeof(amrex::Real),
 
 namespace {
 
+struct GpuAwareMpiCapability {
+  bool query_available = false;
+  bool supported = false;
+};
+
+GpuAwareMpiCapability query_gpu_aware_mpi_capability() {
+  GpuAwareMpiCapability capability;
+#if defined(AMREX_USE_GPU) && defined(AMREX_USE_MPI)
+  int query_available = 0;
+  int supported = 0;
+
+#if defined(AMREX_USE_CUDA)
+#if defined(MPICH_NUMVERSION) && MPICH_NUMVERSION >= 40000000
+  query_available = 1;
+  supported = MPIX_Query_cuda_support() != 0;
+#elif defined(MPIX_CUDA_AWARE_SUPPORT)
+  query_available = 1;
+  supported = MPIX_Query_cuda_support() != 0;
+#endif
+#elif defined(AMREX_USE_HIP)
+#if defined(MPICH_NUMVERSION) && MPICH_NUMVERSION >= 40000000
+  query_available = 1;
+  supported = MPIX_Query_hip_support() != 0;
+#elif defined(MPIX_ROCM_AWARE_SUPPORT)
+  query_available = 1;
+  supported = MPIX_Query_rocm_support() != 0;
+#endif
+#elif defined(AMREX_USE_SYCL)
+#if defined(MPICH_NUMVERSION) && MPICH_NUMVERSION >= 40000000
+  query_available = 1;
+  supported = MPIX_Query_ze_support() != 0;
+#endif
+#endif
+
+  amrex::ParallelDescriptor::ReduceIntMin(query_available);
+  if (query_available) {
+    amrex::ParallelDescriptor::ReduceIntMin(supported);
+    capability.query_available = true;
+    capability.supported = supported != 0;
+  }
+#endif
+  return capability;
+}
+
 constexpr std::array<const char *, 12> adm_variable_names{{
     "ADMBaseX::gxx", "ADMBaseX::gxy", "ADMBaseX::gxz",
     "ADMBaseX::gyy", "ADMBaseX::gyz", "ADMBaseX::gzz",
@@ -68,6 +120,66 @@ public:
 
 private:
   Runtime &state_;
+};
+
+class ActiveBandDeferred final : public std::runtime_error {
+public:
+  using std::runtime_error::runtime_error;
+};
+
+void accumulate_routing_stats(SurfaceRoutingStats &total,
+                              const SurfaceRoutingStats &increment) {
+  total.sent += increment.sent;
+  total.received += increment.received;
+  total.missing += increment.missing;
+  total.duplicate += increment.duplicate;
+  total.invalid += increment.invalid;
+  total.outside_active_band += increment.outside_active_band;
+  total.device_payload_bytes_sent += increment.device_payload_bytes_sent;
+  total.device_payload_bytes_received +=
+      increment.device_payload_bytes_received;
+  total.device_local_copy_bytes += increment.device_local_copy_bytes;
+  total.host_point_data_bytes += increment.host_point_data_bytes;
+  total.control_device_to_host_bytes +=
+      increment.control_device_to_host_bytes;
+  total.control_host_to_device_bytes +=
+      increment.control_host_to_device_bytes;
+  total.mpi_control_bytes_sent += increment.mpi_control_bytes_sent;
+  total.mpi_control_bytes_received += increment.mpi_control_bytes_received;
+  total.device_to_host_control_copies +=
+      increment.device_to_host_control_copies;
+  total.host_to_device_control_copies +=
+      increment.host_to_device_control_copies;
+  total.mpi_count_collectives += increment.mpi_count_collectives;
+  total.mpi_payload_exchange_rounds +=
+      increment.mpi_payload_exchange_rounds;
+  total.mpi_payload_messages_sent +=
+      increment.mpi_payload_messages_sent;
+  total.mpi_payload_messages_received +=
+      increment.mpi_payload_messages_received;
+  total.explicit_device_synchronizations +=
+      increment.explicit_device_synchronizations;
+  total.forward_topology_reuses += increment.forward_topology_reuses;
+  total.forward_topology_rebuilds += increment.forward_topology_rebuilds;
+}
+
+struct SolverTimingStats {
+  amrex::Real adm_gather = 0;
+  amrex::Real mesh_to_logical = 0;
+  amrex::Real source_metadata = 0;
+  amrex::Real logical_to_mesh = 0;
+  amrex::Real redistribution = 0;
+  amrex::Real convergence = 0;
+  amrex::Real pseudo_steps = 0;
+  amrex::Real extrapolation = 0;
+  amrex::Long adm_gather_calls = 0;
+  amrex::Long redistribution_calls = 0;
+  amrex::Long convergence_calls = 0;
+  amrex::Long pseudo_steps_timed = 0;
+  amrex::Long extrapolation_calls = 0;
+  amrex::Long timestep_min_collectives = 0;
+  amrex::Long pseudo_time_min_collectives = 0;
+  amrex::Long device_convergence_checks = 0;
 };
 
 bool policy_uses_external(const char *const policy) {
@@ -213,13 +325,41 @@ int surface_cadence(const int surface) {
                                           : find_every;
 }
 
-bool any_surface_due(const Runtime &state, const int iteration) {
-  for (const auto &surface : state.surfaces)
-    if (surface.lifecycle != ParticleLifecycle::retired &&
-        surface.search_every > 0 && iteration >= surface.next_search_iteration &&
-        iteration % surface.search_every == 0)
-      return true;
-  return false;
+std::vector<SurfaceLevelRange>
+global_surface_level_ranges(Runtime &state,
+                            const std::vector<SurfaceLevelRequest> &requests) {
+  std::vector<amrex::Long> counts(requests.size(), 0);
+  std::vector<int> minimum(requests.size(),
+                           std::numeric_limits<int>::max());
+  std::vector<int> maximum(requests.size(), -1);
+  for (auto &container : state.containers) {
+    const auto local = container->local_surface_level_ranges(requests);
+    if (local.size() != requests.size())
+      CCTK_ERROR("ParticleAHFinderX received an inconsistent local surface "
+                 "level-range table");
+    for (std::size_t index = 0; index < requests.size(); ++index) {
+      if (local[index].stable_id != requests[index].stable_id)
+        CCTK_ERROR("ParticleAHFinderX surface level-range IDs changed order");
+      counts[index] += local[index].particle_count;
+      if (local[index].particle_count > 0) {
+        minimum[index] = std::min(minimum[index], local[index].minimum_level);
+        maximum[index] = std::max(maximum[index], local[index].maximum_level);
+      }
+    }
+  }
+  if (!requests.empty()) {
+    const int count = static_cast<int>(requests.size());
+    amrex::ParallelDescriptor::ReduceLongSum(counts.data(), count);
+    amrex::ParallelDescriptor::ReduceIntMin(minimum.data(), count);
+    amrex::ParallelDescriptor::ReduceIntMax(maximum.data(), count);
+  }
+
+  std::vector<SurfaceLevelRange> result(requests.size());
+  for (std::size_t index = 0; index < requests.size(); ++index)
+    result[index] = {requests[index].stable_id, counts[index],
+                     counts[index] > 0 ? minimum[index] : -1,
+                     maximum[index]};
+  return result;
 }
 
 bool any_surface_has_search_cadence() {
@@ -341,7 +481,7 @@ std::vector<LayerResidual> collect_layer_residuals(
   std::vector<amrex::Real> l2(selections.size(), 0);
   std::vector<amrex::Real> linf(selections.size(), 0);
   for (const auto &diagnostics :
-       state.logical_surfaces->local_surface_diagnostics()) {
+       state.logical_surfaces->local_solver_surface_states()) {
     if (!diagnostics.due)
       continue;
     const SurfaceLayerSelection key{diagnostics.stable_id,
@@ -402,7 +542,7 @@ std::vector<LayerOutcome> collect_layer_outcomes(
   std::vector<amrex::Real> l2(selections.size(), 0);
   std::vector<amrex::Real> linf(selections.size(), 0);
   for (const auto &diagnostics :
-       state.logical_surfaces->local_surface_diagnostics()) {
+       state.logical_surfaces->local_solver_surface_states()) {
     const SurfaceLayerSelection key{diagnostics.stable_id,
                                     diagnostics.angular_level};
     const auto found = std::lower_bound(
@@ -488,6 +628,178 @@ amrex::Long selected_particle_count(
   return count;
 }
 
+std::vector<SurfaceLayerSelection> final_analysis_surface_layers(
+    const Runtime &state,
+    const std::vector<SurfaceLayerSelection> &searched_target_layers,
+    const int iteration) {
+  std::vector<SurfaceLayerSelection> result;
+  result.reserve(searched_target_layers.size());
+  for (const auto &selection : searched_target_layers) {
+    const auto found = std::lower_bound(
+        state.surfaces.begin(), state.surfaces.end(), selection.stable_id,
+        [](const SurfaceRecord &surface, const amrex::Long stable_id) {
+          return surface.stable_id < stable_id;
+        });
+    if (found == state.surfaces.end() ||
+        found->stable_id != selection.stable_id ||
+        selection.angular_level + 1 != found->angular_levels ||
+        found->last_search_iteration != iteration)
+      CCTK_ERROR("ParticleAHFinderX final analysis route lost a searched "
+                 "target layer");
+    // Candidate finalization can retire or reset a failed provisional
+    // population after its physical diagnostics were recorded. Keep only
+    // surviving converged targets in the route consumed by AH_analysis.
+    if (found->lifecycle != ParticleLifecycle::retired &&
+        found->relaxation_state == SurfaceRelaxationState::converged)
+      result.push_back(selection);
+  }
+  return result;
+}
+
+bool same_surface_layers(
+    const std::vector<SurfaceLayerSelection> &first,
+    const std::vector<SurfaceLayerSelection> &second) {
+  return first.size() == second.size() &&
+         std::equal(first.begin(), first.end(), second.begin(),
+                    [](const SurfaceLayerSelection &left,
+                       const SurfaceLayerSelection &right) {
+                      return left.stable_id == right.stable_id &&
+                             left.angular_level == right.angular_level;
+                    });
+}
+
+std::vector<RadialCacheLayer> local_radial_cache_layers(
+    const Runtime &state,
+    const std::vector<SurfaceLayerSelection> &selections) {
+  std::vector<RadialCacheLayer> result;
+  amrex::Long cache_offset = 0;
+  const int rank = amrex::ParallelDescriptor::MyProc();
+  for (const auto &selection : selections) {
+    const auto found = std::lower_bound(
+        state.surfaces.begin(), state.surfaces.end(), selection.stable_id,
+        [](const SurfaceRecord &surface, const amrex::Long stable_id) {
+          return surface.stable_id < stable_id;
+        });
+    if (found == state.surfaces.end() ||
+        found->stable_id != selection.stable_id ||
+        selection.angular_level < 0 ||
+        selection.angular_level >= found->angular_levels)
+      CCTK_ERROR("ParticleAHFinderX radial-cache selection lost its "
+                 "surface metadata");
+    if (found->logical_owner_rank != rank)
+      continue;
+    const auto &layer = found->angular_layer[selection.angular_level];
+    result.push_back({found->stable_id, layer.logical_owner_offset,
+                      layer.particle_count, cache_offset,
+                      selection.angular_level});
+    if (cache_offset > std::numeric_limits<amrex::Long>::max() -
+                           layer.particle_count)
+      CCTK_ERROR("ParticleAHFinderX radial-cache point count overflowed");
+    cache_offset += layer.particle_count;
+  }
+  return result;
+}
+
+std::vector<RadialCacheLayer>
+local_active_radial_cache_layers(Runtime &state) {
+  std::vector<SurfaceLayerSelection> active_layers;
+  for (const auto &surface :
+       state.logical_surfaces->local_solver_surface_states())
+    if (surface.due &&
+        surface.relaxation_state == SurfaceRelaxationState::active)
+      active_layers.push_back(
+          {surface.stable_id, surface.angular_level});
+  std::sort(active_layers.begin(), active_layers.end(),
+            [](const SurfaceLayerSelection &first,
+               const SurfaceLayerSelection &second) {
+              return first.stable_id < second.stable_id ||
+                     (first.stable_id == second.stable_id &&
+                      first.angular_level < second.angular_level);
+            });
+  return local_radial_cache_layers(state, active_layers);
+}
+
+struct SurfaceLayerBatch {
+  std::vector<SurfaceLayerSelection> selected;
+  std::vector<SurfaceLayerSelection> deferred;
+  bool use_radial_cache = false;
+};
+
+SurfaceLayerBatch radial_cache_batch(
+    const Runtime &state,
+    const std::vector<SurfaceLayerSelection> &pending_layers,
+    const int radial_nodes, const int memory_limit_mib) {
+  SurfaceLayerBatch result;
+  result.use_radial_cache = true;
+  const amrex::Long bytes_per_point =
+      amrex::Long(30) * radial_nodes * amrex::Long(sizeof(amrex::Real)) +
+      amrex::Long(2 * sizeof(amrex::Real) + sizeof(amrex::Long) +
+                  sizeof(int));
+  const amrex::Long memory_limit =
+      amrex::Long(memory_limit_mib) * 1024 * 1024;
+  std::vector<amrex::Long> owner_bytes(
+      amrex::ParallelDescriptor::NProcs(), 0);
+  SurfaceRole selected_role = SurfaceRole::other;
+  bool have_selected_role = false;
+
+  for (const auto &selection : pending_layers) {
+    if (!result.use_radial_cache && !result.selected.empty()) {
+      result.deferred.push_back(selection);
+      continue;
+    }
+    const auto found = std::lower_bound(
+        state.surfaces.begin(), state.surfaces.end(), selection.stable_id,
+        [](const SurfaceRecord &surface, const amrex::Long stable_id) {
+          return surface.stable_id < stable_id;
+        });
+    if (found == state.surfaces.end() ||
+        found->stable_id != selection.stable_id ||
+        selection.angular_level < 0 ||
+        selection.angular_level >= found->angular_levels ||
+        found->logical_owner_rank < 0 ||
+        found->logical_owner_rank >=
+            amrex::ParallelDescriptor::NProcs())
+      CCTK_ERROR("ParticleAHFinderX radial-cache batching found invalid "
+                 "surface metadata");
+    // Keep speculative common surfaces separate from established individual
+    // surfaces. A common candidate can legitimately leave its radial envelope;
+    // that must not force an otherwise well-behaved individual-surface batch
+    // back onto the direct path.
+    if (have_selected_role && found->role != selected_role) {
+      result.deferred.push_back(selection);
+      continue;
+    }
+    const amrex::Long points =
+        found->angular_layer[selection.angular_level].particle_count;
+    const amrex::Long bytes =
+        points <= std::numeric_limits<amrex::Long>::max() / bytes_per_point
+            ? points * bytes_per_point
+            : std::numeric_limits<amrex::Long>::max();
+    auto &load = owner_bytes[found->logical_owner_rank];
+    if (bytes <= memory_limit && load <= memory_limit - bytes) {
+      result.selected.push_back(selection);
+      if (!have_selected_role) {
+        selected_role = found->role;
+        have_selected_role = true;
+      }
+      load += bytes;
+    } else if (result.selected.empty() && bytes > memory_limit) {
+      // A single oversized layer cannot be split without angular sharding.
+      // Process it once through the direct path, then continue cache batching
+      // the remaining independent surfaces.
+      result.selected.push_back(selection);
+      selected_role = found->role;
+      have_selected_role = true;
+      result.use_radial_cache = false;
+    } else {
+      result.deferred.push_back(selection);
+    }
+  }
+  if (result.selected.empty())
+    CCTK_ERROR("ParticleAHFinderX radial-cache batching made no progress");
+  return result;
+}
+
 } // namespace
 
 Runtime &runtime() {
@@ -515,6 +827,29 @@ extern "C" void ParticleAHFinderX_ParamCheck(CCTK_ARGUMENTS) {
   if (minimum_relaxation_steps > maximum_relaxation_steps)
     CCTK_PARAMWARN("ParticleAHFinderX minimum_relaxation_steps cannot exceed "
                    "maximum_relaxation_steps");
+  if (use_radial_geometry_cache && radial_geometry_cache_nodes < 4)
+    CCTK_PARAMWARN("ParticleAHFinderX radial geometry caching requires at "
+                   "least four radial nodes");
+  if (use_radial_geometry_cache &&
+      (!(radial_geometry_cache_half_width_factor > 0) ||
+       !(radial_geometry_cache_level_width_factor > 0) ||
+       !(radial_geometry_cache_level_width_factor <= 1) ||
+       (radial_geometry_cache_recenter_passes > 0 &&
+        (!(radial_geometry_cache_recenter_width_factor > 0) ||
+         !(radial_geometry_cache_recenter_width_factor <= 1))) ||
+       !(radial_geometry_cache_validation_tolerance > 0) ||
+       radial_geometry_cache_max_memory_mib <= 0))
+    CCTK_PARAMWARN("ParticleAHFinderX radial geometry caching requires a "
+                   "positive interval half-width, a continuation-level "
+                   "width factor in (0,1], a recenter width factor in "
+                   "(0,1] when recentering is enabled, a positive validation "
+                   "tolerance, and a positive memory ceiling");
+  if (use_radial_geometry_cache &&
+      radial_geometry_cache_direct_step_reserve >=
+          maximum_relaxation_steps)
+    CCTK_PARAMWARN(
+        "ParticleAHFinderX radial_geometry_cache_direct_step_reserve must "
+        "be smaller than maximum_relaxation_steps");
   if (run_domain_exit_self_test &&
       (!retire_on_domain_exit || domain_exit_grace_searches != 1 ||
        num_surfaces != 1 || !surface_enabled[0]))
@@ -535,22 +870,6 @@ extern "C" void ParticleAHFinderX_ParamCheck(CCTK_ARGUMENTS) {
       candidate_retry_max_iterations < candidate_retry_base_iterations)
     CCTK_PARAMWARN("ParticleAHFinderX candidate expiry, radius bracket, and "
                    "retry bounds are inconsistent");
-  if (export_spherical_surfaces &&
-      !CCTK_IsThornActive("SphericalSurface"))
-    CCTK_PARAMWARN("ParticleAHFinderX SphericalSurface export requires the "
-                   "SphericalSurface thorn to be active");
-  if (export_spherical_surfaces &&
-      !CCTK_IsFunctionAliased("sf_IdFromName"))
-    CCTK_PARAMWARN("ParticleAHFinderX SphericalSurface export requires the "
-                   "sf_IdFromName provider");
-  for (int slot = 0; export_spherical_surfaces &&
-                     slot < max_compatibility_slots;
-       ++slot)
-    if (spherical_surface_index[slot] >= 0 &&
-        spherical_surface_name[slot][0] != '\0')
-      CCTK_PARAMWARN("ParticleAHFinderX compatibility slots must map by "
-                     "either SphericalSurface index or name, not both");
-
   try {
     for (const char *const variable : adm_variable_names)
       resolve_mesh_field(variable);
@@ -593,6 +912,7 @@ extern "C" void ParticleAHFinderX_ParamCheck(CCTK_ARGUMENTS) {
 extern "C" void ParticleAHFinderX_Setup(CCTK_ARGUMENTS) {
   DECLARE_CCTK_PARAMETERS;
   auto &state = runtime();
+  state.interpolation_order = interpolation_order;
 
   state.num_patches = CarpetX::ghext->num_patches();
   if (state.num_patches != 1)
@@ -602,10 +922,20 @@ extern "C" void ParticleAHFinderX_Setup(CCTK_ARGUMENTS) {
                 state.num_patches);
 
 #ifdef AMREX_USE_GPU
-  if (require_gpu_aware_mpi && amrex::ParallelDescriptor::NProcs() > 1 &&
-      !amrex::ParallelDescriptor::UseGpuAwareMpi())
-    CCTK_ERROR("ParticleAHFinderX requires GPU-aware MPI for multi-rank "
-               "accelerator routing");
+  const auto mpi_capability = query_gpu_aware_mpi_capability();
+  if (require_gpu_aware_mpi && amrex::ParallelDescriptor::NProcs() > 1) {
+    if (!amrex::ParallelDescriptor::UseGpuAwareMpi() &&
+        mpi_capability.supported)
+      amrex::ParallelDescriptor::use_gpu_aware_mpi = true;
+    if (!amrex::ParallelDescriptor::UseGpuAwareMpi() &&
+        mpi_capability.query_available)
+      CCTK_ERROR("The MPI runtime reports that accelerator-aware "
+                 "communication is unavailable");
+    if (!amrex::ParallelDescriptor::UseGpuAwareMpi())
+      CCTK_ERROR("ParticleAHFinderX requires AMReX direct-device MPI; "
+                 "enable amrex.use_gpu_aware_mpi before AMReX "
+                 "initialization");
+  }
 #endif
 
   if (state.containers.empty()) {
@@ -621,6 +951,8 @@ extern "C" void ParticleAHFinderX_Setup(CCTK_ARGUMENTS) {
   }
   if (!state.logical_surfaces)
     state.logical_surfaces = std::make_unique<LogicalSurfaceStorage>();
+  if (!state.radial_geometry_cache)
+    state.radial_geometry_cache = std::make_unique<RadialGeometryCache>();
 
   try {
     for (std::size_t i = 0; i < adm_variable_names.size(); ++i)
@@ -742,12 +1074,13 @@ extern "C" void ParticleAHFinderX_Initialise(CCTK_ARGUMENTS) {
     container->create_surfaces(pending_seeds);
   state.population_creation_events +=
       static_cast<amrex::Long>(pending_seeds.size());
-  state.logical_surfaces->initialize(local_logical_seeds(state.surfaces));
 
   for (auto &container : state.containers) {
     container->rebuild_amr_masks();
     container->redistribute_global();
   }
+  const auto owner_stats = assign_spatial_logical_owners(state);
+  state.logical_surfaces->initialize(local_logical_seeds(state.surfaces));
 
   amrex::Long actual_particle_count = 0;
   for (const auto &container : state.containers)
@@ -769,11 +1102,23 @@ extern "C" void ParticleAHFinderX_Initialise(CCTK_ARGUMENTS) {
                 static_cast<long long>(global_logical_count),
                 static_cast<long long>(expected_particle_count));
   if (verbose) {
+    const double colocated_fraction =
+        owner_stats.particle_count > 0
+            ? double(owner_stats.colocated_particles) /
+                  double(owner_stats.particle_count)
+            : 1.0;
+    CCTK_VINFO("Provisional spatial logical ownership colocates %lld/%lld "
+               "persistent particle(s) (%.2f%%); maximum owner load=%lld; "
+               "the first complete hierarchy will finalize placement",
+               static_cast<long long>(owner_stats.colocated_particles),
+               static_cast<long long>(owner_stats.particle_count),
+               100.0 * colocated_fraction,
+               static_cast<long long>(owner_stats.maximum_owner_load));
     CCTK_VINFO("Created %zu persistent surface population(s) containing %lld "
                "AMReX particles; ordinary searches will reuse them in place",
                state.surfaces.size(),
                static_cast<long long>(state.global_particle_count));
-    CCTK_VINFO("Logical owner rank %d holds %d complete surface(s) and %lld "
+    CCTK_VINFO("Logical owner rank %d holds %d angular layer(s) and %lld "
                "persistent device point(s)",
                amrex::ParallelDescriptor::MyProc(),
                state.logical_surfaces->local_surface_count(),
@@ -792,20 +1137,58 @@ extern "C" void ParticleAHFinderX_Regrid(CCTK_ARGUMENTS) {
     container->rebuild_amr_masks();
     container->redistribute_global();
   }
+  if (state.radial_geometry_cache)
+    state.radial_geometry_cache->invalidate();
   if (state.regrid_events == std::numeric_limits<amrex::Long>::max())
     CCTK_ERROR("ParticleAHFinderX regrid event counter overflowed");
   ++state.regrid_events;
   state.last_regrid_iteration = cctk_iteration;
 }
 
-extern "C" void ParticleAHFinderX_Analysis(CCTK_ARGUMENTS) {
+void run_analysis(const cGH *const cctkGH, const int forced_surface_count) {
   DECLARE_CCTK_ARGUMENTS;
   DECLARE_CCTK_PARAMETERS;
   auto &state = runtime();
+  const bool forced = forced_surface_count >= 0;
   if (!state.setup)
     CCTK_ERROR("ParticleAHFinderX analysis ran before setup");
-  if (!hierarchy_is_time_aligned())
-    return;
+  ActiveLevelBand band;
+  try {
+    band = active_level_band();
+  } catch (const std::exception &error) {
+    CCTK_VERROR("ParticleAHFinderX cannot establish the active level band: %s",
+                error.what());
+  }
+  if (!state.initial_spatial_ownership_finalized) {
+    if (!band.complete_hierarchy)
+      return;
+    const bool already_searched = std::any_of(
+        state.surfaces.begin(), state.surfaces.end(),
+        [](const SurfaceRecord &surface) {
+          return surface.last_search_iteration >= 0;
+        });
+    if (already_searched)
+      CCTK_ERROR("ParticleAHFinderX cannot finalize initial spatial logical "
+                 "ownership after a surface search");
+    const auto owner_stats = assign_spatial_logical_owners(state);
+    state.logical_surfaces = std::make_unique<LogicalSurfaceStorage>();
+    state.logical_surfaces->initialize(local_logical_seeds(state.surfaces));
+    state.radial_geometry_cache->invalidate();
+    state.initial_spatial_ownership_finalized = true;
+    if (verbose && amrex::ParallelDescriptor::IOProcessor()) {
+      const double colocated_fraction =
+          owner_stats.particle_count > 0
+              ? double(owner_stats.colocated_particles) /
+                    double(owner_stats.particle_count)
+              : 1.0;
+      CCTK_VINFO("Final spatial logical ownership colocates %lld/%lld "
+                 "persistent particle(s) (%.2f%%); maximum owner load=%lld",
+                 static_cast<long long>(owner_stats.colocated_particles),
+                 static_cast<long long>(owner_stats.particle_count),
+                 100.0 * colocated_fraction,
+                 static_cast<long long>(owner_stats.maximum_owner_load));
+    }
+  }
   amrex::Long expected_creation_events = 0;
   for (const auto &surface : state.surfaces)
     expected_creation_events += surface.angular_levels;
@@ -816,26 +1199,164 @@ extern "C" void ParticleAHFinderX_Analysis(CCTK_ARGUMENTS) {
     CCTK_ERROR("ParticleAHFinderX persistent population lifecycle invariant "
                "was violated");
   SolverActivity solver_activity(state);
-  manage_candidates_before_search(
-      state, cctk_iteration, static_cast<amrex::Real>(cctk_time));
-  if (!any_surface_due(state, cctk_iteration))
+  // Candidate birth, retirement, radius resets, and owner compaction perform
+  // hierarchy-wide particle operations. Keep those lifecycle transitions at a
+  // complete synchronized hierarchy even though established surfaces may be
+  // solved on a smaller active band.
+  if (band.complete_hierarchy && !forced)
+    manage_candidates_before_search(
+        state, cctk_iteration, static_cast<amrex::Real>(cctk_time));
+
+  std::vector<amrex::Long> requested_surface_ids;
+  for (const auto &surface : state.surfaces) {
+    const bool selected =
+        forced ? surface.configured_slot >= 0 &&
+                     surface.configured_slot < forced_surface_count
+               : surface.search_every > 0 &&
+                     cctk_iteration >= surface.next_search_iteration &&
+                     cctk_iteration % surface.search_every == 0 &&
+                     surface.last_search_iteration != cctk_iteration &&
+                     (band.complete_hierarchy ||
+                      surface.lifecycle != ParticleLifecycle::candidate);
+    if (surface.lifecycle != ParticleLifecycle::retired && selected)
+      requested_surface_ids.push_back(surface.stable_id);
+  }
+  if (requested_surface_ids.empty())
     return;
 
+  std::vector<SurfaceLevelRequest> level_requests;
+  std::vector<amrex::Long> requested_multilevel_tracking_ids;
+  level_requests.reserve(requested_surface_ids.size());
+  requested_multilevel_tracking_ids.reserve(requested_surface_ids.size());
+  for (const auto stable_id : requested_surface_ids) {
+    const auto found = std::lower_bound(
+        state.surfaces.begin(), state.surfaces.end(), stable_id,
+        [](const SurfaceRecord &surface, const amrex::Long id) {
+          return surface.stable_id < id;
+        });
+    if (found == state.surfaces.end() || found->stable_id != stable_id)
+      CCTK_ERROR("ParticleAHFinderX level eligibility lost a surface record");
+    const bool multilevel_tracking =
+        use_multilevel_tracking && found->last_success_iteration >= 0 &&
+        found->angular_levels > 1;
+    const int selected_level =
+        found->last_success_iteration >= 0 && !multilevel_tracking
+            ? found->angular_levels - 1
+            : -1;
+    level_requests.push_back({stable_id, selected_level});
+    if (multilevel_tracking)
+      requested_multilevel_tracking_ids.push_back(stable_id);
+  }
+  const auto level_ranges =
+      global_surface_level_ranges(state, level_requests);
   std::vector<amrex::Long> due_surface_ids;
-  for (const auto &surface : state.surfaces) {
-    if (surface.lifecycle != ParticleLifecycle::retired &&
-        surface.search_every > 0 &&
-        cctk_iteration >= surface.next_search_iteration &&
-        cctk_iteration % surface.search_every == 0)
-      due_surface_ids.push_back(surface.stable_id);
+  std::vector<amrex::Long> multilevel_tracking_ids;
+  std::vector<SurfaceLevelRequest> target_fallback_requests;
+  due_surface_ids.reserve(requested_surface_ids.size());
+  multilevel_tracking_ids.reserve(requested_surface_ids.size());
+  target_fallback_requests.reserve(requested_surface_ids.size());
+  for (std::size_t index = 0; index < requested_surface_ids.size(); ++index) {
+    const auto found = std::lower_bound(
+        state.surfaces.begin(), state.surfaces.end(),
+        requested_surface_ids[index],
+        [](const SurfaceRecord &surface, const amrex::Long stable_id) {
+          return surface.stable_id < stable_id;
+        });
+    if (found == state.surfaces.end() ||
+        found->stable_id != requested_surface_ids[index])
+      CCTK_ERROR("ParticleAHFinderX level eligibility lost a surface record");
+    const int selected_level = level_requests[index].angular_level;
+    const amrex::Long expected =
+        selected_level >= 0
+            ? found->angular_layer[selected_level].particle_count
+            : total_angular_particle_count(*found);
+    const auto &range = level_ranges[index];
+    if (range.particle_count != expected || range.minimum_level < 0 ||
+        range.maximum_level < range.minimum_level)
+      CCTK_VERROR(
+          "ParticleAHFinderX surface %lld has invalid persistent AMR "
+          "ownership metadata: count=%lld expected=%lld levels=[%d,%d]",
+          static_cast<long long>(found->stable_id),
+          static_cast<long long>(range.particle_count),
+          static_cast<long long>(expected), range.minimum_level,
+          range.maximum_level);
+    if (band.contains(range.minimum_level) &&
+        band.contains(range.maximum_level)) {
+      due_surface_ids.push_back(found->stable_id);
+      if (std::binary_search(requested_multilevel_tracking_ids.begin(),
+                             requested_multilevel_tracking_ids.end(),
+                             found->stable_id))
+        multilevel_tracking_ids.push_back(found->stable_id);
+    } else if (std::binary_search(requested_multilevel_tracking_ids.begin(),
+                                  requested_multilevel_tracking_ids.end(),
+                                  found->stable_id)) {
+      // Coarse helper layers can straddle an asynchronous level even when the
+      // accepted target layer remains wholly inside the active band. Preserve
+      // the requested tracking cadence by falling back to a target-only solve;
+      // an initial acquisition still requires its complete continuation tree.
+      target_fallback_requests.push_back(
+          {found->stable_id, found->angular_levels - 1});
+    }
   }
-  if (state.last_center_prediction_iteration != cctk_iteration) {
-    predict_surface_centers(
-        cctkGH, state, due_surface_ids, cctk_iteration,
-        static_cast<amrex::Real>(cctk_time),
-        maximum_center_extrapolation_intervals);
-    state.last_center_prediction_iteration = cctk_iteration;
+  amrex::Long target_fallback_count = 0;
+  if (!target_fallback_requests.empty()) {
+    const auto fallback_ranges =
+        global_surface_level_ranges(state, target_fallback_requests);
+    for (std::size_t index = 0; index < target_fallback_requests.size();
+         ++index) {
+      const auto found = std::lower_bound(
+          state.surfaces.begin(), state.surfaces.end(),
+          target_fallback_requests[index].stable_id,
+          [](const SurfaceRecord &surface, const amrex::Long stable_id) {
+            return surface.stable_id < stable_id;
+          });
+      if (found == state.surfaces.end() ||
+          found->stable_id != target_fallback_requests[index].stable_id)
+        CCTK_ERROR("ParticleAHFinderX target-only fallback lost a surface "
+                   "record");
+      const auto &range = fallback_ranges[index];
+      const auto expected =
+          found->angular_layer[found->angular_levels - 1].particle_count;
+      if (range.particle_count != expected || range.minimum_level < 0 ||
+          range.maximum_level < range.minimum_level)
+        CCTK_VERROR(
+            "ParticleAHFinderX surface %lld has invalid target-layer AMR "
+            "ownership metadata: count=%lld expected=%lld levels=[%d,%d]",
+            static_cast<long long>(found->stable_id),
+            static_cast<long long>(range.particle_count),
+            static_cast<long long>(expected), range.minimum_level,
+            range.maximum_level);
+      if (band.contains(range.minimum_level) &&
+          band.contains(range.maximum_level)) {
+        due_surface_ids.push_back(found->stable_id);
+        ++target_fallback_count;
+      }
+    }
+    std::sort(due_surface_ids.begin(), due_surface_ids.end());
   }
+  if (verbose && (!band.complete_hierarchy ||
+                  due_surface_ids.size() != requested_surface_ids.size()))
+    CCTK_VINFO(
+        "Active-level-band eligibility at iteration %d time %.17g: "
+        "band=[%d,%d) level_iteration=%lld/%lld requested=%zu eligible=%zu "
+        "deferred=%zu "
+        "target-only-fallback=%lld complete_hierarchy=%s",
+        cctk_iteration, double(cctk_time), band.minimum_level,
+        band.maximum_level,
+        static_cast<long long>(band.logical_iteration_numerator),
+        static_cast<long long>(band.logical_iteration_denominator),
+        requested_surface_ids.size(),
+        due_surface_ids.size(),
+        requested_surface_ids.size() - due_surface_ids.size(),
+        static_cast<long long>(target_fallback_count),
+        band.complete_hierarchy ? "yes" : "no");
+  if (due_surface_ids.empty())
+    return;
+  predict_surface_centers(
+      cctkGH, state, due_surface_ids, cctk_iteration,
+      static_cast<amrex::Real>(cctk_time),
+      maximum_center_extrapolation_intervals, band.minimum_level,
+      band.maximum_level, band.complete_hierarchy);
   if (due_surface_ids.empty())
     return;
   std::vector<SurfaceLayerSelection> due_surface_layers;
@@ -845,11 +1366,16 @@ extern "C" void ParticleAHFinderX_Analysis(CCTK_ARGUMENTS) {
     if (!std::binary_search(due_surface_ids.begin(), due_surface_ids.end(),
                             surface.stable_id))
       continue;
+    const bool multilevel_tracking = std::binary_search(
+        multilevel_tracking_ids.begin(), multilevel_tracking_ids.end(),
+        surface.stable_id);
     surface.active_angular_level =
-        surface.last_success_iteration >= 0 ? surface.angular_levels - 1 : 0;
+        surface.last_success_iteration >= 0 && !multilevel_tracking
+            ? surface.angular_levels - 1
+            : 0;
     due_surface_layers.push_back(
         {surface.stable_id, surface.active_angular_level});
-    if (surface.last_success_iteration < 0)
+    if (surface.last_success_iteration < 0 || multilevel_tracking)
       for (int level = 0; level < surface.angular_levels; ++level)
         bootstrap_surface_layers.push_back({surface.stable_id, level});
     else
@@ -857,13 +1383,54 @@ extern "C" void ParticleAHFinderX_Analysis(CCTK_ARGUMENTS) {
           {surface.stable_id, surface.active_angular_level});
   }
   state.logical_surfaces->set_due_surface_layers(bootstrap_surface_layers);
+  state.logical_surfaces->set_relaxed_helper_surface_ids(
+      multilevel_tracking_ids);
   for (auto &container : state.containers)
     container->set_active_surface_layers(bootstrap_surface_layers);
   amrex::Long active_particle_count =
       selected_particle_count(state, bootstrap_surface_layers);
+  auto &return_route = state.analysis_route_plan;
+  return_route.valid = false;
+  state.analysis_active_point_count = 0;
+  SurfaceRoutingStats routing_performance;
+  SolverTimingStats solver_timing;
+  const bool measure_solver = solve_surfaces && print_timing_stats;
+  amrex::Long mesh_to_logical_calls = 0;
+  amrex::Long source_metadata_calls = 0;
+  amrex::Long logical_to_mesh_calls = 0;
   for (auto &container : state.containers)
     container->begin_sampled_level_tracking();
 
+  const auto redistribute_bounded = [&]() {
+    const amrex::Real start = measure_solver ? amrex::second() : 0;
+    return_route.valid = false;
+    for (auto &container : state.containers) {
+      if (band.complete_hierarchy)
+        container->redistribute_local_hierarchy(max_num_cells_moved);
+      else
+        container->redistribute_active_band(
+            band.minimum_level, band.maximum_level, max_num_cells_moved);
+    }
+    if (measure_solver) {
+      solver_timing.redistribution += amrex::second() - start;
+      ++solver_timing.redistribution_calls;
+    }
+  };
+  const auto redistribute_unbounded = [&]() {
+    const amrex::Real start = measure_solver ? amrex::second() : 0;
+    return_route.valid = false;
+    for (auto &container : state.containers) {
+      if (band.complete_hierarchy)
+        container->redistribute_global();
+      else
+        container->redistribute_active_band(band.minimum_level,
+                                            band.maximum_level, 0);
+    }
+    if (measure_solver) {
+      solver_timing.redistribution += amrex::second() - start;
+      ++solver_timing.redistribution_calls;
+    }
+  };
   try {
     ensure_mesh_fields_ready(
         cctkGH,
@@ -874,6 +1441,7 @@ extern "C" void ParticleAHFinderX_Analysis(CCTK_ARGUMENTS) {
           "ParticleAHFinderX analysis has no active CarpetX levels");
 
     const auto gather = [&](const AdmGatherPass pass) {
+      const amrex::Real start = measure_solver ? amrex::second() : 0;
       for (auto &container : state.containers)
         container->begin_adm_gather();
 
@@ -918,6 +1486,10 @@ extern "C" void ParticleAHFinderX_Analysis(CCTK_ARGUMENTS) {
       }
       amrex::ParallelDescriptor::ReduceLongSum(global_stats.data(),
                                                 int(global_stats.size()));
+      if (measure_solver) {
+        solver_timing.adm_gather += amrex::second() - start;
+        ++solver_timing.adm_gather_calls;
+      }
       return global_stats;
     };
 
@@ -928,18 +1500,22 @@ extern "C" void ParticleAHFinderX_Analysis(CCTK_ARGUMENTS) {
           CCTK_VINFO("Retrying %lld ADM stencil miss(es) after bounded "
                      "AMReX redistribution",
                      static_cast<long long>(global_stats[2]));
-        for (auto &container : state.containers)
-          container->redistribute_local_hierarchy(max_num_cells_moved);
+        redistribute_bounded();
         global_stats = gather(AdmGatherPass::local_retry);
       }
       if (global_stats[2] > 0 || global_stats[3] > 0) {
         if (verbose)
           CCTK_VINFO("Retrying %lld ADM ownership/stencil miss(es) after "
-                     "hierarchy redistribution",
+                     "%s redistribution",
                      static_cast<long long>(global_stats[2] +
-                                            global_stats[3]));
-        for (auto &container : state.containers)
-          container->redistribute_global();
+                                            global_stats[3]),
+                     band.complete_hierarchy ? "hierarchy"
+                                             : "active-band hierarchy");
+        // Every proposed update was preflighted against this synchronized
+        // band before it entered the particle container. A coarse/fine owner
+        // change inside the band is therefore safe; a point requiring an
+        // inactive level is rejected earlier by route_updates().
+        redistribute_unbounded();
         global_stats = gather(AdmGatherPass::final);
       }
 
@@ -966,10 +1542,14 @@ extern "C" void ParticleAHFinderX_Analysis(CCTK_ARGUMENTS) {
       state.last_adm_gather_iteration = cctk_iteration;
     };
 
-    const auto route_and_evaluate = [&]() {
+    const auto route_samples = [&]() {
+      const amrex::Real routing_start = measure_solver ? amrex::second() : 0;
       const auto routing = route_particles_to_logical_owners(
           state.containers, *state.logical_surfaces,
-          LogicalRoutingMode::sampled_fields);
+          LogicalRoutingMode::sampled_fields, return_route,
+          active_particle_count);
+      accumulate_routing_stats(routing_performance, routing);
+      ++mesh_to_logical_calls;
       amrex::Long global_routing[5]{routing.sent, routing.received,
                                     routing.missing, routing.duplicate,
                                     routing.invalid};
@@ -988,36 +1568,23 @@ extern "C" void ParticleAHFinderX_Analysis(CCTK_ARGUMENTS) {
             static_cast<long long>(global_routing[3]),
             static_cast<long long>(global_routing[4]),
             static_cast<long long>(active_particle_count));
-      state.logical_surfaces->evaluate_angular_derivatives();
-      state.logical_surfaces->evaluate_expansion();
-      const ExpansionStats local_expansion =
-          state.logical_surfaces->local_expansion_stats();
-      amrex::Real expansion_sums[2]{
-          local_expansion.area, local_expansion.theta_squared_integral};
-      amrex::Real expansion_linf = local_expansion.theta_linf;
-      amrex::Long invalid_expansion = local_expansion.invalid;
-      amrex::ParallelDescriptor::ReduceRealSum(expansion_sums, 2);
-      amrex::ParallelDescriptor::ReduceRealMax(expansion_linf);
-      amrex::ParallelDescriptor::ReduceLongSum(invalid_expansion);
-      if (invalid_expansion != 0 || !(expansion_sums[0] > 0))
-        CCTK_VERROR("ParticleAHFinderX expansion evaluation failed at %lld "
-                    "point(s); total area=%.17g",
-                    static_cast<long long>(invalid_expansion),
-                    double(expansion_sums[0]));
-      const amrex::Real mean_theta_squared =
-          expansion_sums[1] / expansion_sums[0];
-      state.last_expansion_l2 =
-          mean_theta_squared > 0
-              ? mean_theta_squared * amrex::Math::rsqrt(mean_theta_squared)
-              : 0;
-      state.last_expansion_linf = expansion_linf;
+      if (measure_solver)
+        solver_timing.mesh_to_logical += amrex::second() - routing_start;
       state.last_logical_route_iteration = cctk_iteration;
     };
 
+    const auto evaluate_surface = [&]() {
+      state.logical_surfaces->evaluate_surface_geometry();
+    };
+
     const auto refresh_source_metadata = [&]() {
+      const amrex::Real routing_start = measure_solver ? amrex::second() : 0;
       const auto routing = route_particles_to_logical_owners(
           state.containers, *state.logical_surfaces,
-          LogicalRoutingMode::source_metadata);
+          LogicalRoutingMode::source_metadata, return_route,
+          active_particle_count);
+      accumulate_routing_stats(routing_performance, routing);
+      ++source_metadata_calls;
       amrex::Long global_routing[5]{routing.sent, routing.received,
                                     routing.missing, routing.duplicate,
                                     routing.invalid};
@@ -1036,6 +1603,8 @@ extern "C" void ParticleAHFinderX_Analysis(CCTK_ARGUMENTS) {
             static_cast<long long>(global_routing[3]),
             static_cast<long long>(global_routing[4]),
             static_cast<long long>(active_particle_count));
+      if (measure_solver)
+        solver_timing.source_metadata += amrex::second() - routing_start;
     };
 
     amrex::Long due_particle_count = 0;
@@ -1053,7 +1622,8 @@ extern "C" void ParticleAHFinderX_Analysis(CCTK_ARGUMENTS) {
     }
 
     sample_adm();
-    route_and_evaluate();
+    route_samples();
+    evaluate_surface();
 
     if (run_expansion_self_test &&
         !state.expansion_self_test_complete) {
@@ -1144,13 +1714,27 @@ extern "C" void ParticleAHFinderX_Analysis(CCTK_ARGUMENTS) {
       state.adm_gather_self_test_complete = true;
     }
 
-    const auto route_updates = [&]() {
+    const auto route_updates = [&](const bool defer_outside_band = true) {
+      const amrex::Real routing_start = measure_solver ? amrex::second() : 0;
       const auto routing = route_updates_to_mesh_owners(
-          *state.logical_surfaces, state.containers);
-      amrex::Long global_routing[5]{routing.sent, routing.received,
-                                    routing.missing, routing.duplicate,
-                                    routing.invalid};
-      amrex::ParallelDescriptor::ReduceLongSum(global_routing, 5);
+          *state.logical_surfaces, state.containers, return_route,
+          band.complete_hierarchy ? -1 : band.minimum_level,
+          band.complete_hierarchy ? -1 : band.maximum_level);
+      accumulate_routing_stats(routing_performance, routing);
+      ++logical_to_mesh_calls;
+      amrex::Long global_routing[6]{
+          routing.sent,    routing.received, routing.missing,
+          routing.duplicate, routing.invalid, routing.outside_active_band};
+      amrex::ParallelDescriptor::ReduceLongSum(global_routing, 6);
+      if (measure_solver)
+        solver_timing.logical_to_mesh += amrex::second() - routing_start;
+      if (global_routing[5] != 0) {
+        if (defer_outside_band)
+          throw ActiveBandDeferred(
+              "a proposed particle update left the synchronized active "
+              "level band");
+        return false;
+      }
       if (global_routing[0] != active_particle_count ||
           global_routing[1] != active_particle_count ||
           global_routing[2] != 0 || global_routing[3] != 0 ||
@@ -1165,11 +1749,30 @@ extern "C" void ParticleAHFinderX_Analysis(CCTK_ARGUMENTS) {
             static_cast<long long>(global_routing[3]),
             static_cast<long long>(global_routing[4]),
             static_cast<long long>(active_particle_count));
+      return true;
     };
 
-    const auto convergence = [&](const bool accept_convergence) {
+    if (solve_surfaces && !multilevel_tracking_ids.empty()) {
+      // The first route refreshed every persistent layer from its AMReX
+      // particle. Restrict the accepted target shape into coarse layers, then
+      // return those low-pass states before beginning the correction solve.
+      state.logical_surfaces->restrict_target_to_coarse_layers(
+          multilevel_tracking_ids);
+      state.logical_surfaces->rebuild_positions();
+      route_updates();
+      redistribute_unbounded();
+      sample_adm();
+      route_samples();
+      evaluate_surface();
+    }
+
+    const auto convergence = [&](const bool accept_convergence,
+                                 const bool fail_invalid_geometry = true) {
+      const amrex::Real start = measure_solver ? amrex::second() : 0;
       auto result = state.logical_surfaces->update_solver_convergence(
-          accept_convergence, angular_continuation_cutoff_threshold);
+          accept_convergence, angular_continuation_cutoff_threshold,
+          angular_continuation_helper_tolerance_factor,
+          fail_invalid_geometry);
       amrex::Real maxima[4]{result.maximum_ratio,
                             result.maximum_l2_times_mass,
                             result.maximum_linf_times_mass,
@@ -1187,9 +1790,14 @@ extern "C" void ParticleAHFinderX_Analysis(CCTK_ARGUMENTS) {
       result.converged = counts[2];
       result.refine = counts[3];
       result.failed = counts[4];
+      if (measure_solver) {
+        solver_timing.convergence += amrex::second() - start;
+        ++solver_timing.convergence_calls;
+      }
       return result;
     };
 
+    std::vector<SurfaceLayerSelection> searched_target_layers;
     if (solve_surfaces) {
       const RelaxationIntegrator integrator =
           CCTK_EQUALS(relaxation_integrator, "ssprk3")
@@ -1200,17 +1808,34 @@ extern "C" void ParticleAHFinderX_Analysis(CCTK_ARGUMENTS) {
       std::vector<SurfaceLayerSelection> pending_layers = due_surface_layers;
       std::vector<amrex::Long> converged_surface_ids;
       std::vector<amrex::Long> failed_surface_ids;
-      std::vector<SurfaceLayerSelection> searched_target_layers;
       std::vector<int> surface_steps(due_surface_ids.size(), 0);
       int total_completed_steps = 0;
       amrex::Long processed_point_steps = 0;
+      amrex::Long cached_completed_steps = 0;
+      amrex::Long direct_completed_steps = 0;
+      amrex::Long cached_point_steps = 0;
+      amrex::Long direct_point_steps = 0;
       int total_extrapolation_trials = 0;
       amrex::Long extrapolation_point_evaluations = 0;
-      amrex::Real maximum_terminal_l2_times_mass = 0;
-      amrex::Real maximum_terminal_linf_times_mass = 0;
-      amrex::Real maximum_terminal_ratio = 0;
+      amrex::Real maximum_accepted_target_l2_times_mass = 0;
+      amrex::Real maximum_accepted_target_linf_times_mass = 0;
+      amrex::Real maximum_helper_l2_times_mass = 0;
+      amrex::Real maximum_helper_linf_times_mass = 0;
+      amrex::Real maximum_failed_terminal_ratio = 0;
+      amrex::Long accepted_target_layers = 0;
+      amrex::Long successful_helper_layers = 0;
 
       while (!pending_layers.empty()) {
+        std::vector<SurfaceLayerSelection> deferred_batch_layers;
+        bool cache_this_batch = false;
+        if (use_radial_geometry_cache) {
+          auto batch = radial_cache_batch(
+              state, pending_layers, radial_geometry_cache_nodes,
+              radial_geometry_cache_max_memory_mib);
+          pending_layers = std::move(batch.selected);
+          deferred_batch_layers = std::move(batch.deferred);
+          cache_this_batch = batch.use_radial_cache;
+        }
         for (const auto &selection : pending_layers) {
           const auto found = std::lower_bound(
               state.surfaces.begin(), state.surfaces.end(),
@@ -1224,6 +1849,7 @@ extern "C" void ParticleAHFinderX_Analysis(CCTK_ARGUMENTS) {
           if (selection.angular_level + 1 == found->angular_levels)
             searched_target_layers.push_back(selection);
         }
+        return_route.valid = false;
         state.logical_surfaces->set_due_surface_layers(pending_layers);
         for (auto &container : state.containers)
           container->set_active_surface_layers(pending_layers);
@@ -1231,7 +1857,211 @@ extern "C" void ParticleAHFinderX_Analysis(CCTK_ARGUMENTS) {
             selected_particle_count(state, pending_layers);
         state.logical_surfaces->begin_relaxation_search(
             eta_damping_times_mass);
-        auto residual = convergence(minimum_relaxation_steps == 0);
+        // Selecting the next continuation batch changes the active particle
+        // population.  The sampled geometry for these persistent layers is
+        // already current, but the cached logical-to-mesh transpose belongs
+        // to the previous (possibly larger) selection.  Rebuild only source
+        // metadata before the first accepted update of this batch.
+        refresh_source_metadata();
+        const auto initial_cache_layers =
+            cache_this_batch
+                ? local_radial_cache_layers(state, pending_layers)
+                : std::vector<RadialCacheLayer>{};
+        const auto bytes_per_point =
+            amrex::Long(30) * radial_geometry_cache_nodes *
+                amrex::Long(sizeof(amrex::Real)) +
+            amrex::Long(2 * sizeof(amrex::Real) + sizeof(amrex::Long) +
+                        sizeof(int));
+        const amrex::Long cache_memory_limit =
+            amrex::Long(radial_geometry_cache_max_memory_mib) * 1024 * 1024;
+        std::vector<RadialCacheMeshLevel> cache_mesh_levels;
+        if (cache_this_batch) {
+          cache_mesh_levels.reserve(
+              static_cast<std::size_t>(band.maximum_level -
+                                       band.minimum_level));
+          CarpetX::active_levels->loop_serially([&](auto &level) {
+            const AdmFieldLayout fields =
+                adm_field_layout(level, state.adm_fields);
+            cache_mesh_levels.push_back(
+                {level.level, fields.metric, fields.curv,
+                 fields.metric_component, fields.curv_component,
+                 fields.centering});
+          });
+        }
+        const auto build_radial_cache =
+            [&](const std::vector<RadialCacheLayer> &cache_layers,
+                const amrex::Real half_width_factor,
+                const char *const phase, const int recenter_pass) {
+              if (!cache_this_batch)
+                return false;
+              amrex::Long local_cache_points = 0;
+              for (const auto &layer : cache_layers)
+                local_cache_points += layer.point_count;
+              amrex::Long maximum_cache_points = local_cache_points;
+              amrex::ParallelDescriptor::ReduceLongMax(maximum_cache_points);
+              const amrex::Long maximum_cache_bytes =
+                  maximum_cache_points <=
+                          std::numeric_limits<amrex::Long>::max() /
+                              bytes_per_point
+                      ? maximum_cache_points * bytes_per_point
+                      : std::numeric_limits<amrex::Long>::max();
+              if (maximum_cache_bytes > cache_memory_limit) {
+                if (verbose && amrex::ParallelDescriptor::IOProcessor())
+                  CCTK_VINFO(
+                      "Using direct frozen-slice sampling for a radial-cache "
+                      "batch requiring %.3f MiB above the %d MiB owner limit",
+                      double(maximum_cache_bytes) / (1024.0 * 1024.0),
+                      radial_geometry_cache_max_memory_mib);
+                return false;
+              }
+              const amrex::Real cache_start =
+                  measure_solver ? amrex::second() : 0;
+              state.radial_geometry_cache->prepare(
+                  state.logical_surfaces->device_view(), cache_layers,
+                  radial_geometry_cache_nodes, half_width_factor,
+                  radial_geometry_cache_level_width_factor,
+                  minimum_radius_factor, maximum_radius_factor);
+              const auto cache_routing =
+                  state.radial_geometry_cache->sample_batched(
+                      state.logical_surfaces->device_view(),
+                      *state.containers.front(), cache_mesh_levels,
+                      band.minimum_level, band.maximum_level,
+                      interpolation_order);
+              accumulate_routing_stats(routing_performance, cache_routing);
+              ++mesh_to_logical_calls;
+              ++logical_to_mesh_calls;
+              amrex::Long cache_route_counts[8]{
+                  cache_routing.sent,
+                  cache_routing.received,
+                  cache_routing.missing,
+                  cache_routing.duplicate,
+                  cache_routing.invalid,
+                  cache_routing.outside_active_band,
+                  local_cache_points * radial_geometry_cache_nodes,
+                  static_cast<amrex::Long>(cache_layers.size())};
+              amrex::ParallelDescriptor::ReduceLongSum(cache_route_counts, 8);
+              if (cache_route_counts[0] != cache_route_counts[6] ||
+                  cache_route_counts[1] != cache_route_counts[6] ||
+                  cache_route_counts[2] != 0 ||
+                  cache_route_counts[3] != 0)
+                CCTK_VERROR(
+                    "ParticleAHFinderX batched radial-probe routing failed: "
+                    "sent=%lld received=%lld missing=%lld duplicate=%lld "
+                    "expected=%lld",
+                    static_cast<long long>(cache_route_counts[0]),
+                    static_cast<long long>(cache_route_counts[1]),
+                    static_cast<long long>(cache_route_counts[2]),
+                    static_cast<long long>(cache_route_counts[3]),
+                    static_cast<long long>(cache_route_counts[6]));
+              const bool cache_band_eligible =
+                  cache_route_counts[4] == 0 && cache_route_counts[5] == 0;
+              RadialCacheComparison comparison;
+              if (cache_band_eligible)
+                comparison = state.radial_geometry_cache->compare_direct(
+                    state.logical_surfaces->device_view());
+              else
+                comparison.invalid = 1;
+              amrex::Real cache_errors[2]{
+                  comparison.maximum_absolute_error,
+                  comparison.maximum_scaled_error};
+              amrex::ParallelDescriptor::ReduceRealMax(cache_errors, 2);
+              amrex::ParallelDescriptor::ReduceLongSum(comparison.invalid);
+              const bool accepted =
+                  comparison.invalid == 0 &&
+                  cache_errors[1] <=
+                      radial_geometry_cache_validation_tolerance;
+              if (accepted) {
+                state.radial_geometry_cache->interpolate(
+                    state.logical_surfaces->device_view());
+                evaluate_surface();
+              } else {
+                state.radial_geometry_cache->invalidate();
+                evaluate_surface();
+              }
+              if (verbose && amrex::ParallelDescriptor::IOProcessor()) {
+                CCTK_VINFO(
+                    "Built owner-GPU radial geometry cache: layers=%lld "
+                    "maximum-points=%lld nodes=%d payload=%.3f MiB "
+                    "direct-check absolute/scaled=%.3e/%.3e invalid=%lld "
+                    "active-band-compatible=%s accepted=%s wall=%.6g s "
+                    "phase=%s recenter-pass=%d half-width-factor=%.6g "
+                    "level-width-factor=%.6g batched-probes=%lld "
+                    "route-calls=1/1",
+                    static_cast<long long>(cache_route_counts[7]),
+                    static_cast<long long>(maximum_cache_points),
+                    radial_geometry_cache_nodes,
+                    double(maximum_cache_bytes) / (1024.0 * 1024.0),
+                    double(cache_errors[0]), double(cache_errors[1]),
+                    static_cast<long long>(comparison.invalid),
+                    cache_band_eligible ? "yes" : "no",
+                    accepted ? "yes" : "no",
+                    measure_solver ? double(amrex::second() - cache_start)
+                                   : 0.0,
+                    phase, recenter_pass, double(half_width_factor),
+                    double(radial_geometry_cache_level_width_factor),
+                    static_cast<long long>(cache_route_counts[6]));
+              }
+              return accepted;
+            };
+        amrex::Real radial_cache_half_width =
+            radial_geometry_cache_half_width_factor;
+        int radial_cache_recenter_passes_completed = 0;
+        bool radial_cache_active = false;
+        if (cache_this_batch)
+          radial_cache_active = build_radial_cache(
+              initial_cache_layers, radial_cache_half_width, "initial", 0);
+        auto residual = convergence(minimum_relaxation_steps == 0,
+                                    !radial_cache_active);
+        const auto restore_direct_geometry =
+            [&](const bool reopen_cached_terminals) {
+              if (reopen_cached_terminals)
+                state.logical_surfaces
+                    ->reactivate_due_layers_for_direct_validation();
+              state.logical_surfaces->rebuild_positions();
+              route_updates();
+              redistribute_unbounded();
+              sample_adm();
+              route_samples();
+              evaluate_surface();
+              radial_cache_active = false;
+            };
+        // A cached terminal state is provisional. Validate it against the
+        // mesh first; only a layer reopened by that direct check may use a
+        // narrower cache, and every narrower terminal is checked again here.
+        const auto validate_cached_terminal =
+            [&](const bool accept_convergence, const bool allow_recenter) {
+              while (radial_cache_active && residual.active == 0) {
+                restore_direct_geometry(true);
+                residual = convergence(accept_convergence);
+                if (residual.active == 0 ||
+                    !allow_recenter ||
+                    radial_cache_recenter_passes_completed >=
+                        radial_geometry_cache_recenter_passes)
+                  break;
+                radial_cache_half_width *=
+                    radial_geometry_cache_recenter_width_factor;
+                const int recenter_pass =
+                    radial_cache_recenter_passes_completed + 1;
+                const auto recenter_cache_layers =
+                    local_active_radial_cache_layers(state);
+                radial_cache_active = build_radial_cache(
+                    recenter_cache_layers, radial_cache_half_width,
+                    "recenter", recenter_pass);
+                if (!radial_cache_active)
+                  break;
+                radial_cache_recenter_passes_completed = recenter_pass;
+                residual = convergence(accept_convergence, false);
+                if (residual.invalid != 0) {
+                  restore_direct_geometry(false);
+                  residual = convergence(accept_convergence);
+                }
+              }
+            };
+        if (radial_cache_active && residual.invalid != 0) {
+          restore_direct_geometry(false);
+          residual = convergence(minimum_relaxation_steps == 0);
+        }
+        validate_cached_terminal(minimum_relaxation_steps == 0, true);
         int completed_steps = 0;
         amrex::Real completed_pseudo_time = 0;
         struct ExtrapolationSchedule {
@@ -1258,6 +2088,8 @@ extern "C" void ParticleAHFinderX_Analysis(CCTK_ARGUMENTS) {
         }
         const auto test_relaxation_extrapolation =
             [&](const std::vector<SurfaceLayerSelection> &requested_layers) {
+              const amrex::Real extrapolation_start =
+                  measure_solver ? amrex::second() : 0;
               const auto requested_residuals =
                   collect_layer_residuals(state, requested_layers);
               std::vector<SurfaceLayerSelection> active_layers;
@@ -1291,7 +2123,7 @@ extern "C" void ParticleAHFinderX_Analysis(CCTK_ARGUMENTS) {
                   active_modes.push_back(
                       entry.selection.angular_level + 1 ==
                               found->angular_levels
-                          ? RelaxationExtrapolationMode::mean_height
+                          ? RelaxationExtrapolationMode::low_modes
                           : RelaxationExtrapolationMode::full_shape);
                   baseline_ratio.push_back(ratio);
                   baseline_l2.push_back(entry.expansion_l2);
@@ -1299,7 +2131,7 @@ extern "C" void ParticleAHFinderX_Analysis(CCTK_ARGUMENTS) {
                 }
               }
               if (active_layers.empty())
-                return;
+                return false;
 
               state.logical_surfaces->begin_extrapolation_trials(
                   active_layers);
@@ -1311,6 +2143,7 @@ extern "C" void ParticleAHFinderX_Analysis(CCTK_ARGUMENTS) {
               std::vector<bool> searching(active_layers.size(), true);
               std::vector<SurfaceExtrapolationControl> controls(
                   active_layers.size());
+              bool cached_trial_left_interval = false;
 
               const auto evaluate_controls =
                   [&](const bool reset_accepted_velocity) {
@@ -1319,15 +2152,22 @@ extern "C" void ParticleAHFinderX_Analysis(CCTK_ARGUMENTS) {
                         minimum_radius_factor, maximum_radius_factor,
                         reset_accepted_velocity);
                     state.logical_surfaces->rebuild_positions();
-                    route_updates();
-                    // Extrapolation can intentionally move farther than one
-                    // ordinary CFL-limited step.  Trial populations therefore
-                    // take the safe hierarchy-synchronized redistribution.
-                    for (auto &container : state.containers)
-                      container->redistribute_global();
-                    sample_adm();
-                    route_and_evaluate();
-                    route_updates();
+                    if (radial_cache_active) {
+                      state.radial_geometry_cache->interpolate(
+                          state.logical_surfaces->device_view());
+                      evaluate_surface();
+                    } else {
+                      route_updates();
+                      // Extrapolation can intentionally move farther than one
+                      // ordinary CFL-limited step. Reassign within the current
+                      // synchronized band; a required level outside the band
+                      // is detected by sample_adm() and deferred atomically.
+                      redistribute_unbounded();
+                      sample_adm();
+                      route_samples();
+                      evaluate_surface();
+                      route_updates();
+                    }
                     if (extrapolation_point_evaluations >
                         std::numeric_limits<amrex::Long>::max() -
                             active_particle_count)
@@ -1354,6 +2194,7 @@ extern "C" void ParticleAHFinderX_Analysis(CCTK_ARGUMENTS) {
                   break;
                 evaluate_controls(false);
                 ++total_extrapolation_trials;
+                state.logical_surfaces->evaluate_solver_residuals();
                 const auto trial_residuals =
                     collect_layer_residuals(state, active_layers);
                 for (std::size_t index = 0; index < active_layers.size();
@@ -1361,6 +2202,8 @@ extern "C" void ParticleAHFinderX_Analysis(CCTK_ARGUMENTS) {
                   if (!searching[index])
                     continue;
                   const auto &trial = trial_residuals[index];
+                  cached_trial_left_interval |=
+                      radial_cache_active && trial.invalid_points != 0;
                   const auto &surface = *active_surfaces[index];
                   const amrex::Real trial_ratio = relaxation_residual_ratio(
                       trial.expansion_l2, trial.expansion_linf,
@@ -1412,9 +2255,9 @@ extern "C" void ParticleAHFinderX_Analysis(CCTK_ARGUMENTS) {
                       static_cast<long long>(
                           active_layers[index].stable_id),
                       active_layers[index].angular_level + 1,
-                      active_modes[index] ==
-                              RelaxationExtrapolationMode::mean_height
-                          ? "mean-height"
+                          active_modes[index] ==
+                              RelaxationExtrapolationMode::low_modes
+                          ? "monopole-dipole"
                           : "full-shape",
                       double(best_overstep[index]),
                       double(baseline_ratio[index]),
@@ -1424,22 +2267,45 @@ extern "C" void ParticleAHFinderX_Analysis(CCTK_ARGUMENTS) {
                       double(surface.mass_scale * baseline_linf[index]),
                       double(surface.mass_scale * best_linf[index]));
                 }
+              if (measure_solver) {
+                solver_timing.extrapolation +=
+                    amrex::second() - extrapolation_start;
+                ++solver_timing.extrapolation_calls;
+              }
+              return cached_trial_left_interval;
             };
         if (relaxation_report_every > 0)
           report_relaxation_trials(state, completed_steps,
                                    completed_pseudo_time, "initial");
 
-        for (int step = 0; step < maximum_relaxation_steps &&
-                           residual.active > 0;
-             ++step) {
-          amrex::Real pseudo_dt =
-              state.logical_surfaces->prepare_relaxation_time_steps(
-                  relaxation_cfl_factor);
-          amrex::ParallelDescriptor::ReduceRealMin(pseudo_dt);
-          if (!(pseudo_dt > 0) || !amrex::Math::isfinite(pseudo_dt)) {
-            residual.failed += residual.active;
-            residual.active = 0;
-            break;
+        while (completed_steps < maximum_relaxation_steps &&
+               residual.active > 0) {
+          const bool cached_step = radial_cache_active;
+          const amrex::Real pseudo_step_start =
+              measure_solver ? amrex::second() : 0;
+          state.logical_surfaces->prepare_relaxation_time_steps(
+              relaxation_cfl_factor);
+          amrex::Real pseudo_dt = 0;
+          if (!radial_cache_active) {
+            pseudo_dt = state.logical_surfaces
+                            ->local_minimum_relaxation_time_step();
+            amrex::ParallelDescriptor::ReduceRealMin(pseudo_dt);
+            ++solver_timing.timestep_min_collectives;
+            if (pseudo_dt ==
+                std::numeric_limits<amrex::Real>::max()) {
+              residual = convergence(completed_steps >=
+                                     minimum_relaxation_steps);
+              if (residual.active == 0)
+                break;
+              CCTK_ERROR("ParticleAHFinderX direct relaxation retained an "
+                         "active layer without a finite local timestep");
+            }
+            if (!(pseudo_dt > 0) ||
+                !amrex::Math::isfinite(pseudo_dt)) {
+              residual.failed += residual.active;
+              residual.active = 0;
+              break;
+            }
           }
 
           state.logical_surfaces->begin_relaxation_step();
@@ -1449,37 +2315,109 @@ extern "C" void ParticleAHFinderX_Analysis(CCTK_ARGUMENTS) {
                 angular_dissipation_strength, minimum_radius_factor,
                 maximum_radius_factor);
             if (stage + 1 < num_relaxation_stages) {
-              state.logical_surfaces->evaluate_angular_derivatives();
-              state.logical_surfaces->evaluate_expansion();
+              state.logical_surfaces->evaluate_surface_geometry();
             }
           }
-          amrex::Long invalid_relaxation =
-              state.logical_surfaces->reject_invalid_relaxation_steps();
-          amrex::ParallelDescriptor::ReduceLongSum(invalid_relaxation);
+          amrex::Long invalid_relaxation = 0;
+          if (radial_cache_active) {
+            // Cached relaxation needs no mesh-owner notification. Mark and
+            // restore any invalid surface on the device, then let the
+            // following synchronized convergence record provide the
+            // authoritative global failure count. This removes a device
+            // reduction, host
+            // synchronization, and MPI collective from every ordinary
+            // cached pseudo-step.
+            state.logical_surfaces
+                ->reject_invalid_relaxation_steps_on_device();
+          } else {
+            invalid_relaxation =
+                state.logical_surfaces->reject_invalid_relaxation_steps();
+            amrex::ParallelDescriptor::ReduceLongSum(invalid_relaxation);
+          }
           if (invalid_relaxation != 0 && verbose)
             CCTK_VINFO("Rejected %lld invalid relaxation point update(s); "
                        "only affected surfaces will be rolled back",
                        static_cast<long long>(invalid_relaxation));
+          state.logical_surfaces->accumulate_relaxation_pseudo_time();
 
           state.logical_surfaces->rebuild_positions();
-          state.logical_surfaces->evaluate_angular_derivatives();
-          state.logical_surfaces->evaluate_expansion();
-          route_updates();
-          for (auto &container : state.containers) {
+          // The final internal stage used geometry sampled at the start of
+          // this pseudo-step. The cache path refreshes all 30 ADM components
+          // locally on the owner GPU. The direct path updates the persistent
+          // particle positions and re-gathers the frozen physical slice.
+          if (radial_cache_active) {
+            state.radial_geometry_cache->interpolate(
+                state.logical_surfaces->device_view());
+            evaluate_surface();
+          } else {
+            route_updates();
             // Rejecting one point atomically restores its entire surface to
             // the committed shape. That rollback is not bounded by the
             // ordinary per-step cell-displacement contract.
             if (invalid_relaxation != 0)
-              container->redistribute_global();
-            else
-              container->redistribute_local_hierarchy(max_num_cells_moved);
+              redistribute_unbounded();
+            // Ordinary accepted motion stays on its current mesh owner while
+            // that owner still has a complete stencil. sample_adm() performs
+            // redistribution only after an actual miss.
+            sample_adm();
+            route_samples();
+            evaluate_surface();
           }
-          sample_adm();
-          route_and_evaluate();
-          completed_steps = step + 1;
-          completed_pseudo_time += pseudo_dt;
-          residual = convergence(completed_steps >=
-                                 minimum_relaxation_steps);
+          ++completed_steps;
+          if (!cached_step)
+            completed_pseudo_time += pseudo_dt;
+          const bool synchronize_convergence =
+              !radial_cache_active ||
+              completed_steps %
+                      radial_geometry_cache_convergence_interval ==
+                  0 ||
+              completed_steps == maximum_relaxation_steps ||
+              (relaxation_report_every > 0 &&
+               completed_steps % relaxation_report_every == 0) ||
+              (radial_geometry_cache_direct_step_reserve > 0 &&
+               completed_steps >=
+                   maximum_relaxation_steps -
+                       radial_geometry_cache_direct_step_reserve);
+          amrex::Real synchronized_pseudo_time =
+              std::numeric_limits<amrex::Real>::max();
+          if (cached_step && synchronize_convergence) {
+            synchronized_pseudo_time =
+                state.logical_surfaces
+                    ->local_minimum_relaxation_pseudo_time();
+            amrex::ParallelDescriptor::ReduceRealMin(
+                synchronized_pseudo_time);
+            ++solver_timing.pseudo_time_min_collectives;
+          }
+          if (synchronize_convergence) {
+            residual = convergence(
+                completed_steps >= minimum_relaxation_steps,
+                !radial_cache_active);
+          } else {
+            state.logical_surfaces->update_solver_convergence_on_device(
+                completed_steps >= minimum_relaxation_steps,
+                angular_continuation_cutoff_threshold,
+                angular_continuation_helper_tolerance_factor,
+                !radial_cache_active);
+            ++solver_timing.device_convergence_checks;
+          }
+          if (radial_cache_active && residual.invalid != 0) {
+            restore_direct_geometry(false);
+            residual = convergence(completed_steps >=
+                                   minimum_relaxation_steps);
+          }
+          if (cached_step && synchronize_convergence) {
+            if (synchronized_pseudo_time !=
+                std::numeric_limits<amrex::Real>::max()) {
+              if (!(synchronized_pseudo_time >= 0) ||
+                  !amrex::Math::isfinite(synchronized_pseudo_time))
+                CCTK_ERROR("ParticleAHFinderX cached relaxation produced "
+                           "an invalid synchronized pseudo-time");
+              completed_pseudo_time = synchronized_pseudo_time;
+            } else if (residual.active != 0) {
+              CCTK_ERROR("ParticleAHFinderX cached relaxation retained an "
+                         "active layer without a finite pseudo-time");
+            }
+          }
           if (use_relaxation_extrapolation && residual.active > 0) {
             std::vector<SurfaceLayerSelection> reference_layers;
             std::vector<SurfaceLayerSelection> extrapolation_layers;
@@ -1490,8 +2428,8 @@ extern "C" void ParticleAHFinderX_Analysis(CCTK_ARGUMENTS) {
                   schedule.mass_scale;
               if (completed_pseudo_time < event_time)
                 continue;
-              if (schedule.next_event <= 2 ||
-                  schedule.next_event % 2 == 0) {
+              if (relaxation_extrapolation_reference_event(
+                      schedule.next_event)) {
                 reference_layers.push_back(schedule.selection);
                 schedule.reference_valid = true;
               } else if (schedule.reference_valid) {
@@ -1503,15 +2441,81 @@ extern "C" void ParticleAHFinderX_Analysis(CCTK_ARGUMENTS) {
             state.logical_surfaces->store_extrapolation_reference(
                 reference_layers);
             if (!extrapolation_layers.empty()) {
-              test_relaxation_extrapolation(extrapolation_layers);
-              residual = convergence(completed_steps >=
-                                     minimum_relaxation_steps);
+              const bool cached_trial_left_interval =
+                  test_relaxation_extrapolation(extrapolation_layers);
+              residual = convergence(
+                  completed_steps >= minimum_relaxation_steps,
+                  !radial_cache_active);
+              if (radial_cache_active &&
+                  (cached_trial_left_interval || residual.invalid != 0)) {
+                if (cached_trial_left_interval && verbose &&
+                    amrex::ParallelDescriptor::IOProcessor())
+                  CCTK_VINFO(
+                      "Radial geometry cache handed %lld active layer(s) "
+                      "to direct sampling after an extrapolation trial "
+                      "left its interval at step %d",
+                      static_cast<long long>(residual.active),
+                      completed_steps);
+                restore_direct_geometry(cached_trial_left_interval);
+                residual = convergence(completed_steps >=
+                                       minimum_relaxation_steps);
+              }
             }
+          }
+          const bool cache_recenter_budget_available =
+              completed_steps < maximum_relaxation_steps &&
+              (radial_geometry_cache_direct_step_reserve == 0 ||
+               completed_steps <
+                   maximum_relaxation_steps -
+                       radial_geometry_cache_direct_step_reserve);
+          validate_cached_terminal(
+              completed_steps >= minimum_relaxation_steps,
+              cache_recenter_budget_available);
+          const bool cache_step_budget_exhausted =
+              radial_cache_active &&
+              residual.active > 0 &&
+              radial_geometry_cache_direct_step_reserve > 0 &&
+              completed_steps >=
+                  maximum_relaxation_steps -
+                      radial_geometry_cache_direct_step_reserve;
+          if (cache_step_budget_exhausted) {
+            if (verbose && amrex::ParallelDescriptor::IOProcessor())
+              CCTK_VINFO(
+                  "Radial geometry cache handed %lld active layer(s) to "
+                  "direct sampling after %d step(s), reserving %d direct "
+                  "step(s)",
+                  static_cast<long long>(residual.active), completed_steps,
+                  radial_geometry_cache_direct_step_reserve);
+            restore_direct_geometry(true);
+            residual = convergence(completed_steps >=
+                                   minimum_relaxation_steps);
           }
           if (relaxation_report_every > 0 &&
               completed_steps % relaxation_report_every == 0)
             report_relaxation_trials(state, completed_steps,
                                      completed_pseudo_time, "progress");
+          if (measure_solver) {
+            solver_timing.pseudo_steps += amrex::second() - pseudo_step_start;
+            ++solver_timing.pseudo_steps_timed;
+          }
+          auto &phase_steps = cached_step ? cached_completed_steps
+                                          : direct_completed_steps;
+          auto &phase_point_steps =
+              cached_step ? cached_point_steps : direct_point_steps;
+          if (phase_steps == std::numeric_limits<amrex::Long>::max() ||
+              phase_point_steps >
+                  std::numeric_limits<amrex::Long>::max() -
+                      active_particle_count)
+            CCTK_ERROR("ParticleAHFinderX cache-phase work counter "
+                       "overflowed");
+          ++phase_steps;
+          phase_point_steps += active_particle_count;
+        }
+
+        if (radial_cache_active) {
+          restore_direct_geometry(true);
+          residual = convergence(completed_steps >=
+                                 minimum_relaxation_steps);
         }
 
         const amrex::Long failed_layers = residual.failed + residual.active;
@@ -1533,8 +2537,7 @@ extern "C" void ParticleAHFinderX_Analysis(CCTK_ARGUMENTS) {
         }
         const auto outcomes =
             collect_layer_outcomes(state, pending_layers);
-        state.logical_surfaces->finish_relaxation_search();
-        std::vector<SurfaceLayerSelection> promoted_layers;
+        std::vector<SurfaceLayerProlongation> promoted_layers;
         std::vector<SurfaceLayerSelection> next_layers;
         std::vector<SurfaceLayerSelection> terminal_layers;
         promoted_layers.reserve(outcomes.size());
@@ -1587,21 +2590,30 @@ extern "C" void ParticleAHFinderX_Analysis(CCTK_ARGUMENTS) {
           const amrex::Real ratio = amrex::max(
               l2_times_mass / surface.tolerances.l2_times_mass,
               linf_times_mass / surface.tolerances.linf_times_mass);
-          maximum_terminal_l2_times_mass =
-              amrex::max(maximum_terminal_l2_times_mass, l2_times_mass);
-          maximum_terminal_linf_times_mass =
-              amrex::max(maximum_terminal_linf_times_mass, linf_times_mass);
-          maximum_terminal_ratio =
-              amrex::max(maximum_terminal_ratio, ratio);
-
+          const bool target_layer = outcome.selection.angular_level + 1 ==
+                                    surface.angular_levels;
           if (outcome.relaxation_state ==
               SurfaceRelaxationState::failed) {
+            maximum_failed_terminal_ratio =
+                amrex::max(maximum_failed_terminal_ratio, ratio);
             surface.relaxation_state = SurfaceRelaxationState::failed;
             failed_surface_ids.push_back(surface.stable_id);
             terminal_layers.push_back(outcome.selection);
-          } else if (outcome.selection.angular_level + 1 <
-                     surface.angular_levels) {
-            promoted_layers.push_back(outcome.selection);
+          } else if (!target_layer) {
+            maximum_helper_l2_times_mass =
+                amrex::max(maximum_helper_l2_times_mass, l2_times_mass);
+            maximum_helper_linf_times_mass =
+                amrex::max(maximum_helper_linf_times_mass, linf_times_mass);
+            ++successful_helper_layers;
+            const bool additive_correction = std::binary_search(
+                multilevel_tracking_ids.begin(),
+                multilevel_tracking_ids.end(), surface.stable_id);
+            promoted_layers.push_back(
+                {outcome.selection.stable_id,
+                 outcome.selection.angular_level,
+                 additive_correction
+                     ? SurfaceProlongationMode::additive_correction
+                     : SurfaceProlongationMode::replace});
             next_layers.push_back(
                 {surface.stable_id, outcome.selection.angular_level + 1});
             surface.active_angular_level =
@@ -1611,6 +2623,11 @@ extern "C" void ParticleAHFinderX_Analysis(CCTK_ARGUMENTS) {
                 SurfaceRelaxationState::refine)
               CCTK_ERROR("ParticleAHFinderX target angular layer requested "
                          "an impossible further refinement");
+            maximum_accepted_target_l2_times_mass = amrex::max(
+                maximum_accepted_target_l2_times_mass, l2_times_mass);
+            maximum_accepted_target_linf_times_mass = amrex::max(
+                maximum_accepted_target_linf_times_mass, linf_times_mass);
+            ++accepted_target_layers;
             surface.relaxation_state = SurfaceRelaxationState::converged;
             converged_surface_ids.push_back(surface.stable_id);
             terminal_layers.push_back(outcome.selection);
@@ -1634,10 +2651,14 @@ extern "C" void ParticleAHFinderX_Analysis(CCTK_ARGUMENTS) {
                      "overflowed");
         processed_point_steps += point_steps;
 
-        // A successful source layer initializes its already-persistent next
-        // layer on the owner GPU. Failed layers atomically return to their
-        // committed state in finish_relaxation_search().
+        // The committed source buffer still contains the pre-solve coarse
+        // shape here. Acquisition replaces the next layer with the prolonged
+        // solution; tracking prolongs only the solved coarse correction and
+        // therefore preserves the destination's pre-existing fine modes.
         state.logical_surfaces->prolong_surface_layers(promoted_layers);
+        // Commit successful source layers, or atomically restore failed ones,
+        // only after additive prolongation has consumed that baseline.
+        state.logical_surfaces->finish_relaxation_search();
         if (!next_layers.empty()) {
           std::vector<SurfaceLayerSelection> refresh_layers = terminal_layers;
           refresh_layers.insert(refresh_layers.end(), next_layers.begin(),
@@ -1649,6 +2670,7 @@ extern "C" void ParticleAHFinderX_Analysis(CCTK_ARGUMENTS) {
                              (first.stable_id == second.stable_id &&
                               first.angular_level < second.angular_level);
                     });
+          return_route.valid = false;
           state.logical_surfaces->set_due_surface_layers(refresh_layers);
           for (auto &container : state.containers)
             container->set_active_surface_layers(refresh_layers);
@@ -1663,14 +2685,23 @@ extern "C" void ParticleAHFinderX_Analysis(CCTK_ARGUMENTS) {
         refresh_source_metadata();
         route_updates();
         // Rollback and inter-layer prolongation can move points farther than
-        // the bounded per-step allowance. This is a hierarchy-synchronized
-        // analysis point, so reassign every persistent particle globally.
-        for (auto &container : state.containers)
-          container->redistribute_global();
+        // the bounded per-step allowance. Keep reassignment inside the current
+        // synchronized band; sample_adm() defers if another level is needed.
+        redistribute_unbounded();
         sample_adm();
-        route_and_evaluate();
+        route_samples();
+        evaluate_surface();
         route_updates();
-        pending_layers = std::move(next_layers);
+        pending_layers = std::move(deferred_batch_layers);
+        pending_layers.insert(pending_layers.end(), next_layers.begin(),
+                              next_layers.end());
+        std::sort(pending_layers.begin(), pending_layers.end(),
+                  [](const SurfaceLayerSelection &first,
+                     const SurfaceLayerSelection &second) {
+                    return first.stable_id < second.stable_id ||
+                           (first.stable_id == second.stable_id &&
+                            first.angular_level < second.angular_level);
+                  });
       }
 
       std::sort(converged_surface_ids.begin(), converged_surface_ids.end());
@@ -1697,6 +2728,7 @@ extern "C" void ParticleAHFinderX_Analysis(CCTK_ARGUMENTS) {
       // target layers that were actually searched once, then form their
       // bounded physical diagnostics without exposing an internal layer.
       if (!searched_target_layers.empty()) {
+        return_route.valid = false;
         state.logical_surfaces->set_due_surface_layers(
             searched_target_layers);
         for (auto &container : state.containers)
@@ -1704,7 +2736,8 @@ extern "C" void ParticleAHFinderX_Analysis(CCTK_ARGUMENTS) {
         active_particle_count =
             selected_particle_count(state, searched_target_layers);
         sample_adm();
-        route_and_evaluate();
+        route_samples();
+        evaluate_surface();
         route_updates();
         update_surface_diagnostics(
             *state.logical_surfaces, state.surfaces, cctk_iteration,
@@ -1745,32 +2778,150 @@ extern "C" void ParticleAHFinderX_Analysis(CCTK_ARGUMENTS) {
                    "one terminal outcome per due physical surface");
       state.successful_searches += converged_surfaces;
       state.failed_searches += failed_surfaces;
-      if (verbose)
+      if (verbose && amrex::ParallelDescriptor::IOProcessor())
         CCTK_VINFO(
             "GPU hyperbolic relaxation (%s) completed %d sequential "
-            "level-step(s), point-steps=%lld, extrapolation trials=%d "
-            "point-evaluations=%lld: converged=%lld failed=%lld "
-            "max terminal (M*L2)=%.3g max terminal (M*Linf)=%.3g",
+            "level-step(s), point-steps=%lld, cache/direct "
+            "level-steps=%lld/%lld, cache/direct point-steps=%lld/%lld, "
+            "extrapolation trials=%d point-evaluations=%lld: "
+            "converged=%lld failed=%lld "
+            "accepted target layers=%lld max accepted target (M*L2)=%.3g "
+            "max accepted target (M*Linf)=%.3g; successful helper "
+            "layers=%lld max helper (M*L2)=%.3g max helper "
+            "(M*Linf)=%.3g; failed layers=%lld max failed ratio=%.3g",
             relaxation_integrator, total_completed_steps,
             static_cast<long long>(processed_point_steps),
+            static_cast<long long>(cached_completed_steps),
+            static_cast<long long>(direct_completed_steps),
+            static_cast<long long>(cached_point_steps),
+            static_cast<long long>(direct_point_steps),
             total_extrapolation_trials,
             static_cast<long long>(extrapolation_point_evaluations),
             static_cast<long long>(converged_surfaces),
             static_cast<long long>(failed_surfaces),
-            double(maximum_terminal_l2_times_mass),
-            double(maximum_terminal_linf_times_mass));
-      if (failed_surfaces != 0)
-        CCTK_VWARN(
-            CCTK_WARN_ALERT,
-            "ParticleAHFinderX restored %lld unconverged physical "
-            "surface(s) after %d sequential angular-level step(s) "
-            "(max terminal ratio %.3g)",
-            static_cast<long long>(failed_surfaces), total_completed_steps,
-            double(maximum_terminal_ratio));
+            static_cast<long long>(accepted_target_layers),
+            double(maximum_accepted_target_l2_times_mass),
+            double(maximum_accepted_target_linf_times_mass),
+            static_cast<long long>(successful_helper_layers),
+            double(maximum_helper_l2_times_mass),
+            double(maximum_helper_linf_times_mass),
+            static_cast<long long>(failed_surfaces),
+            double(maximum_failed_terminal_ratio));
+      amrex::Long failed_published_surfaces = 0;
+      amrex::Long failed_unestablished_common_seeds = 0;
+      amrex::Long failed_provisional_surfaces = 0;
+      amrex::Real maximum_failed_published_ratio = 0;
+      amrex::Real maximum_failed_unestablished_common_ratio = 0;
+      amrex::Real maximum_failed_provisional_ratio = 0;
+      for (const auto stable_id : failed_surface_ids) {
+        const auto found = std::lower_bound(
+            state.surfaces.begin(), state.surfaces.end(), stable_id,
+            [](const SurfaceRecord &surface, const amrex::Long id) {
+              return surface.stable_id < id;
+            });
+        if (found == state.surfaces.end() || found->stable_id != stable_id)
+          CCTK_ERROR("ParticleAHFinderX lost a failed surface while "
+                     "reporting its terminal state");
+        const auto &failed_layer =
+            found->angular_layer.at(found->active_angular_level);
+        const amrex::Real failed_ratio = amrex::max(
+            found->mass_scale * failed_layer.expansion_l2 /
+                found->tolerances.l2_times_mass,
+            found->mass_scale * failed_layer.expansion_linf /
+                found->tolerances.linf_times_mass);
+        if (found->published && found->role == SurfaceRole::common &&
+            found->last_success_iteration < 0) {
+          ++failed_unestablished_common_seeds;
+          maximum_failed_unestablished_common_ratio = amrex::max(
+              maximum_failed_unestablished_common_ratio, failed_ratio);
+        } else if (found->published) {
+          ++failed_published_surfaces;
+          maximum_failed_published_ratio =
+              amrex::max(maximum_failed_published_ratio, failed_ratio);
+        } else {
+          ++failed_provisional_surfaces;
+          maximum_failed_provisional_ratio =
+              amrex::max(maximum_failed_provisional_ratio, failed_ratio);
+        }
+      }
+      if (amrex::ParallelDescriptor::IOProcessor()) {
+        if (failed_published_surfaces != 0)
+          CCTK_VWARN(
+              CCTK_WARN_ALERT,
+              "ParticleAHFinderX restored %lld unconverged published "
+              "surface(s) after %d sequential angular-level step(s) "
+              "(max terminal ratio %.3g)",
+              static_cast<long long>(failed_published_surfaces),
+              total_completed_steps,
+              double(maximum_failed_published_ratio));
+        if (verbose && failed_unestablished_common_seeds != 0)
+          CCTK_VINFO(
+              "ParticleAHFinderX left %lld configured common seed(s) "
+              "without an accepted horizon after %d sequential "
+              "angular-level step(s); no previously converged horizon was "
+              "replaced (max terminal ratio %.3g)",
+              static_cast<long long>(failed_unestablished_common_seeds),
+              total_completed_steps,
+              double(maximum_failed_unestablished_common_ratio));
+        if (verbose && failed_provisional_surfaces != 0)
+          CCTK_VINFO(
+              "ParticleAHFinderX left %lld unconverged provisional "
+              "surface(s) unpublished after %d sequential angular-level "
+              "step(s); published horizons are unchanged (max terminal "
+              "ratio %.3g)",
+              static_cast<long long>(failed_provisional_surfaces),
+              total_completed_steps,
+              double(maximum_failed_provisional_ratio));
+      }
       state.last_relaxation_steps = total_completed_steps;
       state.last_search_converged = failed_surfaces == 0;
     } else {
       route_updates();
+    }
+    if (!solve_surfaces)
+      update_surface_diagnostics(
+          *state.logical_surfaces, state.surfaces, cctk_iteration,
+          static_cast<amrex::Real>(cctk_time), 0);
+    if (band.complete_hierarchy && !forced)
+      finalize_candidates_after_search(
+          state, cctk_iteration, static_cast<amrex::Real>(cctk_time));
+
+    if (solve_surfaces && !searched_target_layers.empty()) {
+      const auto analysis_target_layers = final_analysis_surface_layers(
+          state, searched_target_layers, cctk_iteration);
+      if (!same_surface_layers(analysis_target_layers,
+                               searched_target_layers)) {
+        // Retirement compacts logical storage, while a retry reset can
+        // reorder persistent mesh particles. Rebuild only the surviving
+        // target topology from their already sampled device data; no second
+        // ADM gather or host point staging is needed.
+        return_route.valid = false;
+        state.logical_surfaces->set_due_surface_layers(
+            analysis_target_layers);
+        for (auto &container : state.containers)
+          container->set_active_surface_layers(analysis_target_layers);
+        active_particle_count =
+            analysis_target_layers.empty()
+                ? 0
+                : selected_particle_count(state, analysis_target_layers);
+        if (!analysis_target_layers.empty())
+          route_samples();
+      }
+      if (!analysis_target_layers.empty() &&
+          (!return_route.valid ||
+           return_route.active_point_count != active_particle_count))
+        CCTK_ERROR("ParticleAHFinderX final analysis route does not match "
+                   "the surviving target-layer population");
+      state.analysis_active_point_count = active_particle_count;
+    } else if (solve_surfaces) {
+      // A helper layer can fail before any target layer is searched. Do not
+      // leave that internal route available to the subsequent analysis
+      // schedule.
+      return_route.valid = false;
+      state.logical_surfaces->set_due_surface_layers({});
+      for (auto &container : state.containers)
+        container->set_active_surface_layers({});
+      active_particle_count = 0;
     }
     if (solve_surfaces && print_timing_stats) {
       amrex::Gpu::streamSynchronize();
@@ -1784,21 +2935,210 @@ extern "C" void ParticleAHFinderX_Analysis(CCTK_ARGUMENTS) {
       wall_times[1] /= amrex::ParallelDescriptor::NProcs();
       if (amrex::ParallelDescriptor::IOProcessor())
         CCTK_VINFO(
-            "Solver timing: surfaces=%zu points=%lld steps=%d rank wall "
-            "min/avg/max=%.6g/%.6g/%.6g s",
+            "Solver timing: iteration=%d time=%.17g band=[%d,%d) "
+            "level_iteration=%lld/%lld complete_hierarchy=%s surfaces=%zu "
+            "points=%lld steps=%d rank wall min/avg/max=%.6g/%.6g/%.6g s",
+            cctk_iteration, double(cctk_time), band.minimum_level,
+            band.maximum_level,
+            static_cast<long long>(band.logical_iteration_numerator),
+            static_cast<long long>(band.logical_iteration_denominator),
+            band.complete_hierarchy ? "yes" : "no",
             due_surface_ids.size(),
             static_cast<long long>(due_particle_count),
             state.last_relaxation_steps, double(wall_times[0]),
             double(wall_times[1]), double(wall_times[2]));
+
+      amrex::Real component_times[8]{
+          solver_timing.adm_gather,
+          solver_timing.mesh_to_logical,
+          solver_timing.source_metadata,
+          solver_timing.logical_to_mesh,
+          solver_timing.redistribution,
+          solver_timing.convergence,
+          solver_timing.pseudo_steps,
+          solver_timing.extrapolation};
+      amrex::ParallelDescriptor::ReduceRealMax(component_times, 8);
+      amrex::Long component_calls[9]{
+          solver_timing.adm_gather_calls,
+          solver_timing.redistribution_calls,
+          solver_timing.convergence_calls,
+          solver_timing.pseudo_steps_timed,
+          solver_timing.extrapolation_calls,
+          mesh_to_logical_calls,
+          source_metadata_calls,
+          logical_to_mesh_calls,
+          solver_timing.device_convergence_checks};
+      amrex::ParallelDescriptor::ReduceLongMax(component_calls, 9);
+      amrex::Long scalar_collectives[4]{
+          solver_timing.timestep_min_collectives,
+          solver_timing.pseudo_time_min_collectives,
+          component_calls[2], component_calls[2]};
+      if (amrex::ParallelDescriptor::IOProcessor()) {
+        CCTK_VINFO(
+            "Solver timing components (rank maximum): ADM gather=%.6g s "
+            "(%lld calls), mesh-to-logical=%.6g s (%lld calls), "
+            "source-metadata=%.6g s (%lld calls), logical-to-mesh=%.6g s "
+            "(%lld calls), redistribution=%.6g s (%lld calls), "
+            "convergence=%.6g s (%lld synchronized calls, %lld "
+            "device-only checks)",
+            double(component_times[0]),
+            static_cast<long long>(component_calls[0]),
+            double(component_times[1]),
+            static_cast<long long>(component_calls[5]),
+            double(component_times[2]),
+            static_cast<long long>(component_calls[6]),
+            double(component_times[3]),
+            static_cast<long long>(component_calls[7]),
+            double(component_times[4]),
+            static_cast<long long>(component_calls[1]),
+            double(component_times[5]),
+            static_cast<long long>(component_calls[2]),
+            static_cast<long long>(component_calls[8]));
+        CCTK_VINFO(
+            "Solver timing aggregate intervals (rank maximum): pseudo-step="
+            "%.6g s (%lld steps), extrapolation=%.6g s (%lld calls); these "
+            "intervals include nested components and must not be summed",
+            double(component_times[6]),
+            static_cast<long long>(component_calls[3]),
+            double(component_times[7]),
+            static_cast<long long>(component_calls[4]));
+        CCTK_VINFO(
+            "Solver compact scalar MPI collectives: timestep-min=%lld "
+            "pseudo-time-min=%lld convergence-max=%lld "
+            "convergence-sum=%lld total=%lld; "
+            "cached-convergence-interval=%d device-only-checks=%lld",
+            static_cast<long long>(scalar_collectives[0]),
+            static_cast<long long>(scalar_collectives[1]),
+            static_cast<long long>(scalar_collectives[2]),
+            static_cast<long long>(scalar_collectives[3]),
+            static_cast<long long>(scalar_collectives[0] +
+                                   scalar_collectives[1] +
+                                   scalar_collectives[2] +
+                                   scalar_collectives[3]),
+            radial_geometry_cache_convergence_interval,
+            static_cast<long long>(component_calls[8]));
+      }
+
+      amrex::Long byte_counters[8]{
+          routing_performance.device_payload_bytes_sent,
+          routing_performance.device_payload_bytes_received,
+          routing_performance.device_local_copy_bytes,
+          routing_performance.host_point_data_bytes,
+          routing_performance.control_device_to_host_bytes,
+          routing_performance.control_host_to_device_bytes,
+          routing_performance.mpi_control_bytes_sent,
+          routing_performance.mpi_control_bytes_received};
+      amrex::ParallelDescriptor::ReduceLongSum(byte_counters, 8);
+      amrex::Long call_counters[10]{
+          routing_performance.device_to_host_control_copies,
+          routing_performance.host_to_device_control_copies,
+          routing_performance.mpi_count_collectives,
+          routing_performance.mpi_payload_exchange_rounds,
+          routing_performance.explicit_device_synchronizations,
+          mesh_to_logical_calls, source_metadata_calls,
+          logical_to_mesh_calls,
+          routing_performance.forward_topology_reuses,
+          routing_performance.forward_topology_rebuilds};
+      amrex::ParallelDescriptor::ReduceLongMax(call_counters, 10);
+      amrex::Long message_counters[2]{
+          routing_performance.mpi_payload_messages_sent,
+          routing_performance.mpi_payload_messages_received};
+      amrex::ParallelDescriptor::ReduceLongSum(message_counters, 2);
+      if (amrex::ParallelDescriptor::IOProcessor()) {
+        CCTK_VINFO(
+            "Solver routing residency: mesh-to-logical calls=%lld "
+            "metadata-refresh calls=%lld logical-to-mesh calls=%lld; "
+            "forward topology reuse/rebuild=%lld/%lld; point-data host "
+            "staging=%lld B",
+            static_cast<long long>(call_counters[5]),
+            static_cast<long long>(call_counters[6]),
+            static_cast<long long>(call_counters[7]),
+            static_cast<long long>(call_counters[8]),
+            static_cast<long long>(call_counters[9]),
+            static_cast<long long>(byte_counters[3]));
+        CCTK_VINFO(
+            "Solver routing payload bytes (rank sum): device MPI "
+            "sent/received=%lld/%lld local-device-copy=%lld; MPI count "
+            "sent/received=%lld/%lld",
+            static_cast<long long>(byte_counters[0]),
+            static_cast<long long>(byte_counters[1]),
+            static_cast<long long>(byte_counters[2]),
+            static_cast<long long>(byte_counters[6]),
+            static_cast<long long>(byte_counters[7]));
+        CCTK_VINFO(
+            "Solver routing compact control (rank-sum bytes, maximum "
+            "per-rank calls): device-to-host=%lld B/%lld host-to-device=%lld "
+            "B/%lld MPI count collectives/payload exchange rounds=%lld/%lld "
+            "payload messages sent/received=%lld/%lld explicit device "
+            "synchronizations=%lld",
+            static_cast<long long>(byte_counters[4]),
+            static_cast<long long>(call_counters[0]),
+            static_cast<long long>(byte_counters[5]),
+            static_cast<long long>(call_counters[1]),
+            static_cast<long long>(call_counters[2]),
+            static_cast<long long>(call_counters[3]),
+            static_cast<long long>(message_counters[0]),
+            static_cast<long long>(message_counters[1]),
+            static_cast<long long>(call_counters[4]));
+      }
     }
-    if (!solve_surfaces)
-      update_surface_diagnostics(
-          *state.logical_surfaces, state.surfaces, cctk_iteration,
-          static_cast<amrex::Real>(cctk_time), 0);
-    finalize_candidates_after_search(
-        state, cctk_iteration, static_cast<amrex::Real>(cctk_time));
-    update_tracking_history(cctkGH, state, cctk_iteration,
-                            static_cast<amrex::Real>(cctk_time));
+    if (!forced)
+      update_tracking_history(cctkGH, state, cctk_iteration,
+                              static_cast<amrex::Real>(cctk_time));
+  } catch (const ActiveBandDeferred &error) {
+    // Every selected logical layer retains a committed device state. Restore
+    // it even if a coarse continuation layer just finished: in that case the
+    // completed source remains committed while its unsafe fine prolongation is
+    // discarded. Refresh reverse-routing addresses after any preceding band
+    // redistribution, then return the persistent mesh particles to the same
+    // state without touching an asynchronous level.
+    state.logical_surfaces->defer_relaxation_search();
+    state.logical_surfaces->rebuild_positions();
+    const auto metadata = route_particles_to_logical_owners(
+        state.containers, *state.logical_surfaces,
+        LogicalRoutingMode::source_metadata, return_route,
+        active_particle_count);
+    accumulate_routing_stats(routing_performance, metadata);
+    ++source_metadata_calls;
+    amrex::Long metadata_stats[5]{metadata.sent, metadata.received,
+                                  metadata.missing, metadata.duplicate,
+                                  metadata.invalid};
+    amrex::ParallelDescriptor::ReduceLongSum(metadata_stats, 5);
+    if (metadata_stats[0] != active_particle_count ||
+        metadata_stats[1] != active_particle_count ||
+        metadata_stats[2] != 0 || metadata_stats[3] != 0 ||
+        metadata_stats[4] != 0)
+      CCTK_ERROR("ParticleAHFinderX could not restore source metadata after "
+                 "an active-band deferral");
+    const auto updates = route_updates_to_mesh_owners(
+        *state.logical_surfaces, state.containers, return_route,
+        band.minimum_level,
+        band.maximum_level);
+    accumulate_routing_stats(routing_performance, updates);
+    ++logical_to_mesh_calls;
+    amrex::Long update_stats[6]{
+        updates.sent,    updates.received, updates.missing,
+        updates.duplicate, updates.invalid, updates.outside_active_band};
+    amrex::ParallelDescriptor::ReduceLongSum(update_stats, 6);
+    if (update_stats[0] != active_particle_count ||
+        update_stats[1] != active_particle_count || update_stats[2] != 0 ||
+        update_stats[3] != 0 || update_stats[4] != 0 ||
+        update_stats[5] != 0)
+      CCTK_ERROR("ParticleAHFinderX could not restore mesh particles after "
+                 "an active-band deferral");
+    redistribute_unbounded();
+    state.logical_surfaces->set_due_surface_ids({});
+    for (auto &container : state.containers)
+      container->set_active_surface_layers({});
+    if (verbose)
+      CCTK_VINFO(
+          "Deferred %zu surface search(es) at iteration %d time %.17g: %s; "
+          "active band=[%d,%d) level_iteration=%lld/%lld",
+          due_surface_ids.size(), cctk_iteration, double(cctk_time),
+          error.what(), band.minimum_level, band.maximum_level,
+          static_cast<long long>(band.logical_iteration_numerator),
+          static_cast<long long>(band.logical_iteration_denominator));
+    return;
   } catch (const std::exception &error) {
     CCTK_VERROR("ParticleAHFinderX ADM gather failed: %s", error.what());
   }
@@ -1812,6 +3152,54 @@ extern "C" void ParticleAHFinderX_Analysis(CCTK_ARGUMENTS) {
                state.surfaces.size());
     state.reported_solver_pending = true;
   }
+}
+
+extern "C" void ParticleAHFinderX_Analysis(CCTK_ARGUMENTS) {
+  run_analysis(cctkGH, -1);
+}
+
+extern "C" CCTK_INT ParticleAHFinderX_MeasureInitialMasses_Impl(
+    CCTK_POINTER_TO_CONST cctkGH_pointer, const CCTK_INT npunctures,
+    CCTK_REAL *const measured_mass, CCTK_INT *const valid) {
+  if (!cctkGH_pointer || npunctures < 0 || !measured_mass || !valid)
+    return -1;
+  for (int puncture = 0; puncture < npunctures; ++puncture) {
+    measured_mass[puncture] =
+        std::numeric_limits<CCTK_REAL>::quiet_NaN();
+    valid[puncture] = 0;
+  }
+
+  const auto *const cctkGH = static_cast<const cGH *>(cctkGH_pointer);
+  auto &state = runtime();
+  if (!state.setup || !state.initial_surfaces_created)
+    return -1;
+
+  run_analysis(cctkGH, npunctures);
+  SurfaceAnalysisOptions analysis_options;
+  analysis_options.compute_invariant_spin = true;
+  const auto records = current_surface_analysis(
+      cctkGH, cctkGH->cctk_iteration, false, nullptr, analysis_options);
+  for (const auto &record : records) {
+    const auto surface = std::lower_bound(
+        state.surfaces.begin(), state.surfaces.end(), record.stable_id,
+        [](const SurfaceRecord &candidate, const std::int64_t stable_id) {
+          return candidate.stable_id < stable_id;
+        });
+    if (surface == state.surfaces.end() ||
+        surface->stable_id != record.stable_id)
+      CCTK_ERROR("ParticleAHFinderX calibration lost a surface record");
+    const int puncture = surface->configured_slot;
+    const CCTK_REAL mass = record.invariant_spin_valid
+                               ? record.invariant_christodoulou_mass
+                               : record.christodoulou_mass;
+    if (puncture >= 0 && puncture < npunctures && std::isfinite(mass) &&
+        mass > 0.0) {
+      measured_mass[puncture] = mass;
+      valid[puncture] = 1;
+    }
+    surface->last_analysis_api_iteration = -1;
+  }
+  return 0;
 }
 
 extern "C" int ParticleAHFinderX_Shutdown() {

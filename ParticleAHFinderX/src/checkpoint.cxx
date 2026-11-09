@@ -2,6 +2,7 @@
  * \file checkpoint.cxx
  * \brief Quiescent AMReX particle checkpoint and decomposition-safe recovery.
  */
+#include "io.hxx"
 #include "runtime.hxx"
 #include "surface_manager.hxx"
 
@@ -17,11 +18,13 @@
 #include <mpi.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <fstream>
 #include <iomanip>
+#include <iterator>
 #include <limits>
 #include <sstream>
 #include <string>
@@ -32,7 +35,7 @@
 namespace ParticleAHFinderX {
 namespace {
 
-constexpr int checkpoint_schema = 12;
+constexpr int checkpoint_schema = 15;
 constexpr const char *particle_dataset_name = "surface_particles";
 constexpr const char *metadata_name = "ParticleAHFinderX.meta";
 
@@ -87,13 +90,31 @@ std::uint64_t configuration_hash() {
   hash_value(hash, num_surfaces);
   hash_value(hash, interpolation_order);
   hash_value(hash, enable_angular_continuation);
+  hash_value(hash, use_multilevel_tracking);
   hash_value(hash, angular_continuation_max_levels);
   hash_value(hash, angular_continuation_min_ntheta);
   hash_value(hash, candidate_angular_continuation_min_ntheta);
   hash_value(hash, angular_continuation_cutoff_threshold);
+  hash_value(hash, angular_continuation_helper_tolerance_factor);
+  hash_value(hash, max_num_cells_moved);
+  hash_value(hash, solve_surfaces);
+  hash_value(hash, use_radial_geometry_cache);
+  hash_value(hash, radial_geometry_cache_nodes);
+  hash_value(hash, radial_geometry_cache_half_width_factor);
+  hash_value(hash, radial_geometry_cache_level_width_factor);
+  hash_value(hash, radial_geometry_cache_recenter_passes);
+  hash_value(hash, radial_geometry_cache_recenter_width_factor);
+  hash_value(hash, radial_geometry_cache_validation_tolerance);
+  hash_value(hash, radial_geometry_cache_max_memory_mib);
+  hash_value(hash, radial_geometry_cache_direct_step_reserve);
+  hash_value(hash, radial_geometry_cache_convergence_interval);
   hash_value(hash, maximum_relaxation_steps);
   hash_value(hash, minimum_relaxation_steps);
   hash_value(hash, relaxation_cfl_factor);
+  hash_value(hash, use_relaxation_extrapolation);
+  hash_value(hash, relaxation_extrapolation_interval_times_mass);
+  hash_value(hash, maximum_relaxation_extrapolation_factor);
+  hash_value(hash, minimum_relaxation_extrapolation_improvement);
   hash_value(hash, eta_damping_times_mass);
   hash_value(hash, angular_dissipation_strength);
   hash_value(hash, minimum_radius_factor);
@@ -102,11 +123,6 @@ std::uint64_t configuration_hash() {
   hash_value(hash, retire_on_domain_exit);
   hash_value(hash, domain_exit_grace_searches);
   hash_value(hash, find_every);
-  hash_value(hash, export_spherical_surfaces);
-  for (int slot = 0; slot < max_compatibility_slots; ++slot) {
-    hash_value(hash, spherical_surface_index[slot]);
-    hash_string(hash, spherical_surface_name[slot]);
-  }
   hash_value(hash, enable_dynamic_common_horizons);
   hash_value(hash, candidate_find_every);
   hash_value(hash, candidate_ntheta);
@@ -162,6 +178,9 @@ void validate_quiescent_state(const Runtime &state) {
   if (state.solver_in_flight || state.checkpoint_in_progress)
     CCTK_ERROR("ParticleAHFinderX checkpoint requested while surface work is "
                "in flight");
+  if (!state.pending_candidate_events.empty())
+    CCTK_ERROR("ParticleAHFinderX checkpoint requested before candidate "
+               "events were committed");
 }
 
 void write_metadata(const std::string &root, const cGH *const cctkGH,
@@ -191,8 +210,6 @@ void write_metadata(const std::string &root, const cGH *const cctkGH,
            << state.last_particle_output_iteration << '\n';
   metadata << "last_diagnostics_iteration "
            << state.last_diagnostics_iteration << '\n';
-  metadata << "last_spherical_export_iteration "
-           << state.last_spherical_export_iteration << '\n';
   metadata << "successful_searches " << state.successful_searches << '\n';
   metadata << "failed_searches " << state.failed_searches << '\n';
   metadata << "regrid_events " << state.regrid_events << '\n';
@@ -246,6 +263,8 @@ void write_metadata(const std::string &root, const cGH *const cctkGH,
              << surface.cumulative_sampled_level_changes << ' '
              << surface.last_search_iteration << ' '
              << surface.last_success_iteration << ' '
+             << surface.last_native_diagnostics_iteration << ' '
+             << surface.last_compatibility_diagnostics_iteration << ' '
              << surface.last_search_time << ' ' << surface.last_search_steps
              << ' ' << surface.search_every << ' '
              << surface.next_search_iteration << ' '
@@ -337,7 +356,6 @@ struct RecoveredState {
   amrex::Long population_creation_events = -1;
   int last_particle_output_iteration = -1;
   int last_diagnostics_iteration = -1;
-  int last_spherical_export_iteration = -1;
   amrex::Long successful_searches = 0;
   amrex::Long failed_searches = 0;
   amrex::Long regrid_events = 0;
@@ -383,8 +401,6 @@ RecoveredState read_metadata(const std::string &filename) {
       metadata >> recovered.last_particle_output_iteration;
     else if (key == "last_diagnostics_iteration")
       metadata >> recovered.last_diagnostics_iteration;
-    else if (key == "last_spherical_export_iteration")
-      metadata >> recovered.last_spherical_export_iteration;
     else if (key == "successful_searches")
       metadata >> recovered.successful_searches;
     else if (key == "failed_searches")
@@ -419,6 +435,12 @@ RecoveredState read_metadata(const std::string &filename) {
         layer.relaxation_state =
             static_cast<SurfaceRelaxationState>(layer_state);
       }
+      // The top-level offset is derived from the immutable target angular
+      // layer and is intentionally not a second serialized field. Rebuild it
+      // before metadata validation and decomposition-specific owner rebuild.
+      surface.logical_owner_offset =
+          surface.angular_layer[surface.angular_levels - 1]
+              .logical_owner_offset;
       metadata >>
           surface.center[0] >> surface.center[1] >> surface.center[2] >>
           surface.radius >> surface.mass_scale >>
@@ -443,7 +465,10 @@ RecoveredState read_metadata(const std::string &filename) {
           surface.maximum_sampled_level >> surface.sampled_level_changes >>
           surface.cumulative_sampled_level_changes >>
           surface.last_search_iteration >>
-          surface.last_success_iteration >> surface.last_search_time >>
+          surface.last_success_iteration >>
+          surface.last_native_diagnostics_iteration >>
+          surface.last_compatibility_diagnostics_iteration >>
+          surface.last_search_time >>
           surface.last_search_steps >> surface.search_every >>
           surface.next_search_iteration >> surface.consecutive_failures >>
           center_policy >> surface.predict_center >>
@@ -654,7 +679,7 @@ void validate_metadata(const RecoveredState &recovered,
         !std::isfinite(surface.manual_center[0]) ||
         !std::isfinite(surface.manual_center[1]) ||
         !std::isfinite(surface.manual_center[2]) ||
-        surface.configured_slot < -1 ||
+        surface.generation < 0 || surface.configured_slot < -1 ||
         surface.configured_slot >= max_configured_surfaces ||
         surface.compatibility_slot == 0 || surface.compatibility_slot < -1 ||
         surface.compatibility_slot > max_compatibility_slots ||
@@ -662,6 +687,16 @@ void validate_metadata(const RecoveredState &recovered,
         surface.last_search_iteration > recovered.iteration ||
         surface.last_success_iteration > recovered.iteration ||
         surface.last_history_iteration > recovered.iteration ||
+        surface.last_native_diagnostics_iteration > recovered.iteration ||
+        surface.last_compatibility_diagnostics_iteration >
+            recovered.iteration ||
+        surface.last_native_diagnostics_iteration < -1 ||
+        surface.last_compatibility_diagnostics_iteration < -1 ||
+        surface.last_native_diagnostics_iteration >
+            std::max(surface.last_search_iteration,
+                     surface.last_state_change_iteration) ||
+        surface.last_compatibility_diagnostics_iteration >
+            surface.last_search_iteration ||
         surface.last_search_steps < 0 || surface.invalid_points < 0 ||
         !((surface.minimum_sampled_level == -1 &&
            surface.maximum_sampled_level == -1) ||
@@ -699,6 +734,60 @@ void validate_metadata(const RecoveredState &recovered,
       expected_particles += layer_particles;
     maximum_surface_id = surface.stable_id;
   }
+  std::vector<std::vector<amrex::Long>> constituent_lineage(
+      recovered.surfaces.size());
+  for (std::size_t index = 0; index < recovered.surfaces.size(); ++index) {
+    const auto &surface = recovered.surfaces[index];
+    if (surface.generation == 0) {
+      if (surface.parent_ids[0] != 0 || surface.parent_ids[1] != 0)
+        CCTK_ERROR("ParticleAHFinderX generation-zero checkpoint surface "
+                   "has parent IDs");
+      constituent_lineage[index] = {surface.stable_id};
+      continue;
+    }
+    if (surface.role != SurfaceRole::common || surface.parent_ids[0] <= 0 ||
+        surface.parent_ids[1] <= 0)
+      CCTK_ERROR("ParticleAHFinderX generated checkpoint surface has invalid "
+                 "role or parent IDs");
+    std::array<std::size_t, 2> parent_index;
+    for (int parent = 0; parent < 2; ++parent) {
+      const auto found = std::lower_bound(
+          recovered.surfaces.begin(),
+          recovered.surfaces.begin() + index, surface.parent_ids[parent],
+          [](const SurfaceRecord &candidate, const amrex::Long stable_id) {
+            return candidate.stable_id < stable_id;
+          });
+      if (found == recovered.surfaces.begin() + index ||
+          found->stable_id != surface.parent_ids[parent])
+        CCTK_ERROR("ParticleAHFinderX generated checkpoint surface does not "
+                   "reference two older surfaces");
+      parent_index[parent] =
+          static_cast<std::size_t>(found - recovered.surfaces.begin());
+    }
+    const int parent_generation =
+        std::max(recovered.surfaces[parent_index[0]].generation,
+                 recovered.surfaces[parent_index[1]].generation);
+    if (parent_generation == std::numeric_limits<int>::max() ||
+        surface.generation != parent_generation + 1)
+      CCTK_ERROR("ParticleAHFinderX checkpoint surface generation does not "
+                 "match its parents");
+    std::vector<amrex::Long> overlap;
+    std::set_intersection(
+        constituent_lineage[parent_index[0]].begin(),
+        constituent_lineage[parent_index[0]].end(),
+        constituent_lineage[parent_index[1]].begin(),
+        constituent_lineage[parent_index[1]].end(),
+        std::back_inserter(overlap));
+    if (!overlap.empty())
+      CCTK_ERROR("ParticleAHFinderX checkpoint surface combines overlapping "
+                 "constituent lineages");
+    std::set_union(
+        constituent_lineage[parent_index[0]].begin(),
+        constituent_lineage[parent_index[0]].end(),
+        constituent_lineage[parent_index[1]].begin(),
+        constituent_lineage[parent_index[1]].end(),
+        std::back_inserter(constituent_lineage[index]));
+  }
   amrex::Long expected_creation_events = 0;
   for (const auto &surface : recovered.surfaces)
     expected_creation_events += surface.angular_levels;
@@ -709,7 +798,6 @@ void validate_metadata(const RecoveredState &recovered,
       recovered.next_particle_id < maximum_particle_end ||
       recovered.last_particle_output_iteration > recovered.iteration ||
       recovered.last_diagnostics_iteration > recovered.iteration ||
-      recovered.last_spherical_export_iteration > recovered.iteration ||
       recovered.regrid_events < 0 ||
       recovered.last_regrid_iteration > recovered.iteration ||
       recovered.last_regrid_iteration < -1 ||
@@ -736,44 +824,28 @@ void recover_checkpoint(const cGH *const cctkGH) {
                                      particle_dataset_name);
 
   state.surfaces = std::move(recovered.surfaces);
-  assign_logical_owners(state.surfaces);
-  state.logical_surfaces = std::make_unique<LogicalSurfaceStorage>();
-  state.logical_surfaces->initialize(local_logical_seeds(state.surfaces));
-  const auto ownership =
-      ParticleAHFinderX::logical_ownership(state.surfaces);
-  std::vector<amrex::Long> surface_counts(ownership.size(), 0);
   for (auto &container : state.containers) {
-    const auto local_counts = container->remap_logical_ownership(ownership);
-    for (std::size_t surface = 0; surface < surface_counts.size(); ++surface)
-      surface_counts[surface] += local_counts[surface];
     container->rebuild_amr_masks();
     container->redistribute_global();
   }
-  if (!surface_counts.empty())
-    amrex::ParallelDescriptor::ReduceLongSum(
-        surface_counts.data(), static_cast<int>(surface_counts.size()));
-  for (std::size_t surface = 0; surface < surface_counts.size(); ++surface) {
-    const auto record = std::lower_bound(
-        state.surfaces.begin(), state.surfaces.end(),
-        ownership[surface].surface_id,
-        [](const SurfaceRecord &candidate, const amrex::Long stable_id) {
-          return candidate.stable_id < stable_id;
-        });
-    if (record == state.surfaces.end() ||
-        record->stable_id != ownership[surface].surface_id)
-      CCTK_ERROR("ParticleAHFinderX recovered ownership has an unknown "
-                 "surface ID");
-    const int level = ownership[surface].angular_level;
-    if (level < 0 || level >= record->angular_levels)
-      CCTK_ERROR("ParticleAHFinderX recovered ownership has an invalid "
-                 "angular layer");
-    const amrex::Long expected = record->angular_layer[level].particle_count;
-    if (surface_counts[surface] != expected)
-      CCTK_VERROR("ParticleAHFinderX restored %lld particles for surface %lld "
-                  "angular level %d, expected %lld",
-                  static_cast<long long>(surface_counts[surface]),
-                  static_cast<long long>(record->stable_id),
-                  level, static_cast<long long>(expected));
+  const auto owner_stats = assign_spatial_logical_owners(state);
+  state.logical_surfaces = std::make_unique<LogicalSurfaceStorage>();
+  state.logical_surfaces->initialize(local_logical_seeds(state.surfaces));
+  if (state.radial_geometry_cache)
+    state.radial_geometry_cache->invalidate();
+  state.initial_spatial_ownership_finalized = true;
+  if (verbose && amrex::ParallelDescriptor::IOProcessor()) {
+    const double colocated_fraction =
+        owner_stats.particle_count > 0
+            ? double(owner_stats.colocated_particles) /
+                  double(owner_stats.particle_count)
+            : 1.0;
+    CCTK_VINFO("Recovered spatial logical ownership colocates %lld/%lld "
+               "persistent particle(s) (%.2f%%); maximum owner load=%lld",
+               static_cast<long long>(owner_stats.colocated_particles),
+               static_cast<long long>(owner_stats.particle_count),
+               100.0 * colocated_fraction,
+               static_cast<long long>(owner_stats.maximum_owner_load));
   }
 
   amrex::Long global_particles = 0;
@@ -792,8 +864,6 @@ void recover_checkpoint(const cGH *const cctkGH) {
   state.last_particle_output_iteration =
       recovered.last_particle_output_iteration;
   state.last_diagnostics_iteration = recovered.last_diagnostics_iteration;
-  state.last_spherical_export_iteration =
-      recovered.last_spherical_export_iteration;
   state.successful_searches = recovered.successful_searches;
   state.failed_searches = recovered.failed_searches;
   state.regrid_events = recovered.regrid_events;
@@ -805,6 +875,10 @@ void recover_checkpoint(const cGH *const cctkGH) {
   state.last_checkpoint_runtime = CCTK_RunTime();
   state.last_adm_gather_iteration = -1;
   state.last_logical_route_iteration = -1;
+
+  if (particle_out_every > 0)
+    reconcile_particle_output(particle_out_dir, particle_out_backend,
+                              state.last_particle_output_iteration);
 
   if (verbose)
     CCTK_VINFO("Recovered %zu persistent surface population(s) and %lld "

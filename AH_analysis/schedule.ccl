@@ -1,0 +1,22 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+if (active) {
+  SCHEDULE AH_analysis_ParamCheck AT CCTK_PARAMCHECK
+  {
+    LANG: C
+    OPTIONS: global
+  } "Validate dynamic apparent-horizon analysis parameters"
+
+  SCHEDULE AH_analysis_Calculate AT analysis
+    AFTER ParticleAHFinderX_Analysis
+  {
+    LANG: C
+    OPTIONS: global
+  } "Compute GPU-native quasi-local records for newly found dynamic horizons"
+
+  SCHEDULE AH_analysis_Shutdown AT shutdown
+  {
+    LANG: C
+    OPTIONS: meta
+  } "Release dynamic apparent-horizon analysis output state"
+}

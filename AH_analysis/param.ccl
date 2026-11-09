@@ -1,0 +1,97 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+RESTRICTED:
+
+BOOLEAN active "Enable dynamic stable-ID apparent-horizon analysis"
+{
+} no
+
+BOOLEAN published_only "Analyze only published horizons, excluding provisional candidates"
+{
+} yes
+
+INT output_every "Write records at this physical iteration cadence" STEERABLE=always
+{
+  1:* :: "Positive output cadence"
+} 1
+
+STRING out_dir "Dynamic apparent-horizon analysis output directory"
+{
+  ".+" :: "Directory path"
+} "ah_analysis"
+
+BOOLEAN verbose "Report concise dynamic analysis summaries" STEERABLE=always
+{
+} no
+
+BOOLEAN print_analysis_timing "Report GPU analysis, compact transport, and TSV output timing/counters" STEERABLE=always
+{
+} no
+
+INT point_output_every "Write GPU-native analysis point fields at this scalar-output-aligned cadence" STEERABLE=always
+{
+  0 :: "Disabled"
+  1:* :: "Point-output cadence"
+} 0
+
+STRING point_out_dir "GPU-native analysis point-field output directory"
+{
+  ".+" :: "Directory path"
+} "ah_analysis_points"
+
+KEYWORD point_out_backend "openPMD analysis point-output backend"
+{
+  "bp5" :: "ADIOS2 BP5"
+} "bp5"
+
+INT point_output_chunk_points "Maximum logical-owner points staged through pinned host memory per output chunk"
+{
+  1:* :: "Positive bounded chunk size"
+} 65536
+
+BOOLEAN compute_invariant_spin "Solve the variational axial mode and compute invariant horizon spin"
+{
+} no
+
+BOOLEAN compute_multipoles "Compute invariant mass and spin multipoles through degree eight"
+{
+} no
+
+BOOLEAN compute_coordinate_fluxes "Compute finite-radius ADM and conformal-ADM coordinate fluxes"
+{
+} no
+
+BOOLEAN compute_weyl_curvature "Compute vacuum 3+1 Weyl scalars and speciality diagnostics"
+{
+} no
+
+BOOLEAN compute_weinberg_fluxes "Compute gauge-consistent four-metric Weinberg energy, momentum, and angular momentum"
+{
+} no
+
+KEYWORD ricci_source "Source used for Newman--Penrose Ricci projections"
+{
+  "off" :: "Do not compute Ricci projections"
+  "vacuum" :: "Set R_ab=0 while validating and exporting the surface null tetrad"
+  "tmunu" :: "Construct R_ab from the ten covariant TmunuBaseX components"
+} "off"
+
+INT axial_harmonic_degree "Maximum real spherical-harmonic degree in the variational axial trial space"
+{
+  1:6 :: "Supported device Rayleigh-Ritz degree"
+} 4
+
+INT axial_maximum_jacobi_sweeps "Maximum cyclic Jacobi sweeps for each projected generalized eigenproblem"
+{
+  1:512 :: "Positive bounded device eigensolver work"
+} 64
+
+REAL axial_eigen_tolerance "Relative convergence tolerance for the projected eigensolver"
+{
+  (0.0:1.0) :: "Positive relative tolerance"
+} 1.0e-12
+
+REAL axial_minimum_axis_separation "Minimum pole separation in units of areal radius"
+{
+  (0.0:2.0) :: "Positive geometric degeneracy guard"
+} 0.1

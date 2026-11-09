@@ -1,0 +1,7 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+IMPLEMENTS: AH_analysis
+
+INHERITS: ParticleAHFinderX
+
+USES INCLUDE HEADER: particleahfinderx_analysis.hxx

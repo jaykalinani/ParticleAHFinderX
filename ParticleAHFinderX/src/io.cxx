@@ -5,6 +5,7 @@
  * Parallel chunking and pinned-host transport are confined to output cadence.
  * The solver defines its own surface schema and lifecycle rules.
  */
+#include "io.hxx"
 #include "runtime.hxx"
 
 #include <cctk.h>
@@ -23,13 +24,18 @@
 #include <openPMD/openPMD.hpp>
 #endif
 
+#include <cctype>
+#include <cmath>
 #include <cstdint>
+#include <filesystem>
 #include <fstream>
 #include <iomanip>
+#include <limits>
 #include <memory>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <system_error>
 
 namespace ParticleAHFinderX {
 namespace {
@@ -51,6 +57,54 @@ std::string patch_name(const std::size_t patch) {
   std::ostringstream stream;
   stream << "patch" << std::setw(2) << std::setfill('0') << patch;
   return stream.str();
+}
+
+std::string particle_frame_name(const int iteration,
+                                const char *const backend,
+                                const bool temporary) {
+  return std::string(particle_dataset_name) + ".it" +
+         iteration_string(iteration) + (temporary ? ".tmp." : ".") +
+         backend;
+}
+
+bool all_decimal_characters(const std::string &value,
+                            const std::size_t begin,
+                            const std::size_t end) {
+  if (begin >= end)
+    return false;
+  for (std::size_t index = begin; index < end; ++index)
+    if (!std::isdigit(static_cast<unsigned char>(value[index])))
+      return false;
+  return true;
+}
+
+bool recognized_particle_frame(const std::string &name,
+                               const char *const backend, int &iteration,
+                               bool &temporary) {
+  const std::string prefix = std::string(particle_dataset_name) + ".it";
+  if (!name.starts_with(prefix))
+    return false;
+
+  const std::string final_suffix = std::string(".") + backend;
+  const std::string temporary_suffix = std::string(".tmp.") + backend;
+  temporary = name.ends_with(temporary_suffix);
+  const std::string &suffix = temporary ? temporary_suffix : final_suffix;
+  if (!name.ends_with(suffix))
+    return false;
+  const std::size_t iteration_end = name.size() - suffix.size();
+  if (!all_decimal_characters(name, prefix.size(), iteration_end))
+    return false;
+
+  try {
+    const long long parsed =
+        std::stoll(name.substr(prefix.size(), iteration_end - prefix.size()));
+    if (parsed < 0 || parsed > std::numeric_limits<int>::max())
+      return false;
+    iteration = static_cast<int>(parsed);
+  } catch (const std::exception &) {
+    return false;
+  }
+  return true;
 }
 
 bool output_time_is_valid(const cGH *const cctkGH, const int cadence) {
@@ -89,7 +143,17 @@ void write_debug_tsv(const cGH *const cctkGH) {
             "angular_levels itheta iphi ntheta nphi lifecycle role "
             "validity sampled_level h v "
             "sampled_level_changed expansion normal_x normal_y normal_z "
-            "area_weight\n";
+            "area_weight\n"
+            "# schema 6; one row per persistent particle, including internal "
+            "angular-continuation layers in this bounded debug format.\n"
+            "# angular_level, itheta, and iphi are zero based; h is radial "
+            "height; v is pseudo-time relaxation velocity; expansion is "
+            "the outgoing expansion Theta_(l).\n"
+            "# lifecycle: 0=candidate 1=active 2=retired; role: "
+            "0=individual 1=common 2=other.\n"
+            "# validity: 0=sampled 1=not_sampled 2=needs_local_redistribute "
+            "3=needs_hierarchy_redistribute 4=outside_domain "
+            "5=invalid_stencil 6=nonfinite.\n";
   output << std::setprecision(17);
 
   // This intentionally copies only a hard-bounded debug population to pinned
@@ -163,17 +227,46 @@ void write_openpmd(const cGH *const cctkGH) {
   auto &state = runtime();
   if (state.last_particle_output_iteration == cctkGH->cctk_iteration)
     return;
-  if (CCTK_CreateDirectory(0755, particle_out_dir) < 0)
+  if (!std::isfinite(cctkGH->cctk_time) ||
+      !(cctkGH->cctk_delta_time > 0) ||
+      !std::isfinite(cctkGH->cctk_delta_time))
     throw std::runtime_error(
-        "Could not create the ParticleAHFinderX output directory");
+        "ParticleAHFinderX output received invalid physical-time metadata");
 
-  const std::string filename =
-      std::string(particle_out_dir) + "/" + particle_dataset_name + ".it" +
-      iteration_string(cctkGH->cctk_iteration) + "." + particle_out_backend;
-  openPMD::Series series(filename, openPMD::Access::CREATE,
+  const auto communicator = amrex::ParallelDescriptor::Communicator();
+  const int rank = amrex::ParallelDescriptor::MyProc();
+  if (rank == 0 && CCTK_CreateDirectory(0755, particle_out_dir) < 0)
+    amrex::Abort("Could not create the ParticleAHFinderX output directory");
+  MPI_Barrier(communicator);
+
+  const std::filesystem::path directory(particle_out_dir);
+  const std::filesystem::path final_path =
+      directory / particle_frame_name(cctkGH->cctk_iteration,
+                                      particle_out_backend, false);
+  const std::filesystem::path temporary_path =
+      directory / particle_frame_name(cctkGH->cctk_iteration,
+                                      particle_out_backend, true);
+  if (rank == 0) {
+    std::error_code error;
+    if (std::filesystem::exists(final_path, error))
+      amrex::Abort("ParticleAHFinderX particle frame already exists without "
+                   "a matching checkpoint watermark");
+    if (error)
+      amrex::Abort("ParticleAHFinderX could not inspect the particle-output "
+                   "frame");
+    std::filesystem::remove_all(temporary_path, error);
+    if (error)
+      amrex::Abort("ParticleAHFinderX could not remove an abandoned "
+                   "temporary particle frame");
+  }
+  MPI_Barrier(communicator);
+
+  openPMD::Series series(temporary_path.string(), openPMD::Access::CREATE,
                          amrex::ParallelDescriptor::Communicator());
   series.setSoftware("ParticleAHFinderX", "0.1.0");
   auto &iteration = series.iterations[cctkGH->cctk_iteration];
+  iteration.setTime(static_cast<double>(cctkGH->cctk_time));
+  iteration.setDt(static_cast<double>(cctkGH->cctk_delta_time));
   iteration.setAttribute("schemaVersion", output_schema);
   iteration.setAttribute("cactusTime", static_cast<double>(cctkGH->cctk_time));
   iteration.setAttribute("coordinateSystem", std::string("Cartesian"));
@@ -197,6 +290,25 @@ void write_openpmd(const cGH *const cctkGH) {
     auto &species =
         iteration.particles[std::string(particle_dataset_name) + "_" +
                             patch_name(patch)];
+    species.setAttribute(
+        "description",
+        std::string("Persistent apparent-horizon target-layer particles"));
+    species.setAttribute("angularIndexing",
+                         std::string("zero-based latitude-longitude cells"));
+    species.setAttribute("lifecycleCodes",
+                         std::string("0=candidate;1=active;2=retired"));
+    species.setAttribute("roleCodes",
+                         std::string("0=individual;1=common;2=other"));
+    species.setAttribute(
+        "validityCodes",
+        std::string("0=sampled;1=not_sampled;2=needs_local_redistribute;"
+                    "3=needs_hierarchy_redistribute;4=outside_domain;"
+                    "5=invalid_stencil;6=nonfinite"));
+    species.setAttribute(
+        "fieldMeaning",
+        std::string("height=radial height;relaxationVelocity=pseudo-time "
+                    "velocity;expansion=outgoing expansion Theta_(l);"
+                    "areaWeight=proper-area quadrature weight"));
     auto &position = species["position"];
     auto &position_offset = species["positionOffset"];
     for (const char *axis : {"x", "y", "z"}) {
@@ -476,12 +588,67 @@ void write_openpmd(const cGH *const cctkGH) {
   iteration.close();
   series.flush();
   series.close();
+
+  MPI_Barrier(communicator);
+  if (rank == 0) {
+    std::error_code error;
+    std::filesystem::rename(temporary_path, final_path, error);
+    if (error)
+      amrex::Abort("ParticleAHFinderX could not commit the particle-output "
+                   "frame");
+  }
+  MPI_Barrier(communicator);
   state.last_particle_output_iteration = cctkGH->cctk_iteration;
 }
 
 #endif // HAVE_CAPABILITY_openPMD_api
 
 } // namespace
+
+void reconcile_particle_output(const char *const directory,
+                               const char *const backend,
+                               const int last_committed_iteration) {
+  if (!directory || directory[0] == '\0' || !backend ||
+      std::string(backend) != "bp5" || last_committed_iteration < -1)
+    amrex::Abort("ParticleAHFinderX received invalid particle-output recovery "
+                 "metadata");
+
+  if (amrex::ParallelDescriptor::MyProc() == 0) {
+    const std::filesystem::path root(directory);
+    std::error_code error;
+    const bool exists = std::filesystem::exists(root, error);
+    if (error)
+      amrex::Abort("ParticleAHFinderX could not inspect the particle-output "
+                   "directory during recovery");
+    if (exists) {
+      std::filesystem::directory_iterator entry(root, error);
+      const std::filesystem::directory_iterator end;
+      if (error)
+        amrex::Abort("ParticleAHFinderX could not scan the particle-output "
+                     "directory during recovery");
+      while (entry != end) {
+        const std::filesystem::path path = entry->path();
+        entry.increment(error);
+        if (error)
+          amrex::Abort("ParticleAHFinderX could not continue scanning the "
+                       "particle-output directory during recovery");
+        int frame_iteration = -1;
+        bool temporary = false;
+        if (recognized_particle_frame(path.filename().string(), backend,
+                                      frame_iteration, temporary) &&
+            (temporary ||
+             frame_iteration > last_committed_iteration)) {
+          error.clear();
+          std::filesystem::remove_all(path, error);
+          if (error)
+            amrex::Abort("ParticleAHFinderX could not reconcile a future or "
+                         "temporary particle-output frame");
+        }
+      }
+    }
+  }
+  MPI_Barrier(amrex::ParallelDescriptor::Communicator());
+}
 
 extern "C" void ParticleAHFinderX_Output(CCTK_ARGUMENTS) {
   DECLARE_CCTK_ARGUMENTS;

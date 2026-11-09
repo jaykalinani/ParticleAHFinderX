@@ -35,6 +35,13 @@ struct AdmInterpolationData {
   amrex::GpuArray<amrex::Real, 6> curv;
 };
 
+/** Additional derivatives gathered only for curvature analysis. */
+struct CurvatureDerivativeData {
+  // Derivative-pair order: xx, xy, xz, yy, yz, zz.
+  amrex::GpuArray<amrex::GpuArray<amrex::Real, 6>, 6> dd_gamma;
+  amrex::GpuArray<amrex::GpuArray<amrex::Real, 6>, 3> d_curv;
+};
+
 AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE void interpolation_coordinates(
     const amrex::GpuArray<amrex::Real, 3> &position,
     const amrex::GpuArray<amrex::Real, 3> &prob_lo,
@@ -114,6 +121,57 @@ cubic_lagrange_weights(const amrex::Real fraction,
   derivative[1] = 3 * fraction2 / 2 - 2 * fraction - amrex::Real(1) / 2;
   derivative[2] = -3 * fraction2 / 2 + fraction + 1;
   derivative[3] = fraction2 / 2 - amrex::Real(1) / 6;
+}
+
+AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE void
+cubic_lagrange_second_weights(
+    const amrex::Real fraction, amrex::GpuArray<amrex::Real, 4> &weight,
+    amrex::GpuArray<amrex::Real, 4> &derivative,
+    amrex::GpuArray<amrex::Real, 4> &second_derivative) noexcept {
+  cubic_lagrange_weights(fraction, weight, derivative);
+  second_derivative[0] = 1 - fraction;
+  second_derivative[1] = 3 * fraction - 2;
+  second_derivative[2] = 1 - 3 * fraction;
+  second_derivative[3] = fraction;
+}
+
+/**
+ * Interpolate one component from uniformly spaced samples along a radial ray.
+ *
+ * `samples` is node-major for one logical point: consecutive radial nodes are
+ * separated by `node_stride` entries.  Boundary intervals use the first or
+ * last four nodes without extrapolating beyond `[lower_radius, upper_radius]`.
+ */
+AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE bool
+radial_cubic_interpolate(const amrex::Real *const samples,
+                         const amrex::Long node_stride,
+                         const int radial_nodes,
+                         const amrex::Real lower_radius,
+                         const amrex::Real upper_radius,
+                         const amrex::Real radius,
+                         amrex::Real &value) noexcept {
+  if (samples == nullptr || node_stride <= 0 || radial_nodes < 4 ||
+      !(upper_radius > lower_radius) ||
+      !amrex::Math::isfinite(lower_radius) ||
+      !amrex::Math::isfinite(upper_radius) ||
+      !amrex::Math::isfinite(radius) || radius < lower_radius ||
+      radius > upper_radius)
+    return false;
+
+  const amrex::Real coordinate =
+      (radial_nodes - 1) * (radius - lower_radius) /
+      (upper_radius - lower_radius);
+  int first = static_cast<int>(amrex::Math::floor(coordinate)) - 1;
+  first = amrex::max(0, amrex::min(first, radial_nodes - 4));
+  const amrex::Real fraction = coordinate - (first + 1);
+  amrex::GpuArray<amrex::Real, 4> weight;
+  amrex::GpuArray<amrex::Real, 4> derivative;
+  cubic_lagrange_weights(fraction, weight, derivative);
+
+  value = 0;
+  for (int node = 0; node < 4; ++node)
+    value += weight[node] * samples[amrex::Long(first + node) * node_stride];
+  return amrex::Math::isfinite(value);
 }
 
 AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE bool
@@ -280,6 +338,101 @@ tensor_cubic_interpolate_adm(
   return adm_interpolation_is_finite(data)
              ? InterpolationStatus::success
              : InterpolationStatus::nonfinite;
+}
+
+/**
+ * Gather only the higher derivatives required by the 3+1 Weyl tensor.
+ *
+ * Base metric, metric-gradient, and curvature values remain in the persistent
+ * particle state. This optional fused pass therefore transports only the 36
+ * symmetric metric Hessians and 18 curvature gradients requested at analysis
+ * cadence; ordinary searches do not pay their register or storage cost.
+ */
+AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE InterpolationStatus
+tensor_cubic_interpolate_curvature_derivatives(
+    const amrex::Array4<const amrex::Real> &metric,
+    const int metric_component,
+    const amrex::Array4<const amrex::Real> &curvature,
+    const int curvature_component,
+    const amrex::GpuArray<amrex::Real, 3> &position,
+    const amrex::GpuArray<amrex::Real, 3> &prob_lo,
+    const amrex::GpuArray<amrex::Real, 3> &inv_dx,
+    const FieldCentering centering, const amrex::Box &metric_available,
+    const amrex::Box &curvature_available,
+    CurvatureDerivativeData &data) noexcept {
+  amrex::GpuArray<int, 3> cell;
+  amrex::GpuArray<amrex::Real, 3> fraction;
+  interpolation_coordinates(position, prob_lo, inv_dx, centering, cell,
+                            fraction);
+  const amrex::GpuArray<int, 3> lower{{cell[0] - 1, cell[1] - 1,
+                                       cell[2] - 1}};
+  const amrex::GpuArray<int, 3> upper{{cell[0] + 2, cell[1] + 2,
+                                       cell[2] + 2}};
+  if (!stencil_is_available(lower, upper, metric_available) ||
+      !stencil_is_available(lower, upper, curvature_available))
+    return InterpolationStatus::stencil_unavailable;
+
+  amrex::GpuArray<amrex::Real, 4> weight[3];
+  amrex::GpuArray<amrex::Real, 4> derivative[3];
+  amrex::GpuArray<amrex::Real, 4> second_derivative[3];
+  for (int d = 0; d < 3; ++d)
+    cubic_lagrange_second_weights(fraction[d], weight[d], derivative[d],
+                                  second_derivative[d]);
+  for (int pair = 0; pair < 6; ++pair)
+    for (int component = 0; component < 6; ++component)
+      data.dd_gamma[pair][component] = 0;
+  for (int d = 0; d < 3; ++d)
+    for (int component = 0; component < 6; ++component)
+      data.d_curv[d][component] = 0;
+
+  for (int dk = 0; dk < 4; ++dk)
+    for (int dj = 0; dj < 4; ++dj)
+      for (int di = 0; di < 4; ++di) {
+        const int i = lower[0] + di;
+        const int j = lower[1] + dj;
+        const int k = lower[2] + dk;
+        const amrex::Real first_weight[3]{
+            derivative[0][di] * weight[1][dj] * weight[2][dk],
+            weight[0][di] * derivative[1][dj] * weight[2][dk],
+            weight[0][di] * weight[1][dj] * derivative[2][dk]};
+        const amrex::Real second_weight[6]{
+            second_derivative[0][di] * weight[1][dj] * weight[2][dk],
+            derivative[0][di] * derivative[1][dj] * weight[2][dk],
+            derivative[0][di] * weight[1][dj] * derivative[2][dk],
+            weight[0][di] * second_derivative[1][dj] * weight[2][dk],
+            weight[0][di] * derivative[1][dj] * derivative[2][dk],
+            weight[0][di] * weight[1][dj] * second_derivative[2][dk]};
+        for (int component = 0; component < 6; ++component) {
+          const amrex::Real gamma =
+              metric(i, j, k, metric_component + component);
+          const amrex::Real curv =
+              curvature(i, j, k, curvature_component + component);
+          for (int pair = 0; pair < 6; ++pair)
+            data.dd_gamma[pair][component] +=
+                second_weight[pair] * gamma;
+          for (int d = 0; d < 3; ++d)
+            data.d_curv[d][component] += first_weight[d] * curv;
+        }
+      }
+
+  const amrex::Real second_scale[6]{
+      inv_dx[0] * inv_dx[0], inv_dx[0] * inv_dx[1],
+      inv_dx[0] * inv_dx[2], inv_dx[1] * inv_dx[1],
+      inv_dx[1] * inv_dx[2], inv_dx[2] * inv_dx[2]};
+  for (int pair = 0; pair < 6; ++pair)
+    for (int component = 0; component < 6; ++component)
+      data.dd_gamma[pair][component] *= second_scale[pair];
+  for (int d = 0; d < 3; ++d)
+    for (int component = 0; component < 6; ++component) {
+      data.d_curv[d][component] *= inv_dx[d];
+      if (!amrex::Math::isfinite(data.d_curv[d][component]))
+        return InterpolationStatus::nonfinite;
+    }
+  for (int pair = 0; pair < 6; ++pair)
+    for (int component = 0; component < 6; ++component)
+      if (!amrex::Math::isfinite(data.dd_gamma[pair][component]))
+        return InterpolationStatus::nonfinite;
+  return InterpolationStatus::success;
 }
 
 /**

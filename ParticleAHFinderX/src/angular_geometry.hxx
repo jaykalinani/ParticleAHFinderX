@@ -21,6 +21,32 @@ struct AngularGeometry {
 };
 
 /**
+ * Ratio between the exact latitude-cell solid angle and its midpoint form.
+ *
+ * A cell centered at theta with width dtheta has exact unit-sphere measure
+ *
+ *   2 sin(theta) sin(dtheta / 2) dphi,
+ *
+ * whereas a plain midpoint rule uses sin(theta) dtheta dphi.  Factoring this
+ * ratio from a regular radial-graph area Jacobian integrates a round sphere
+ * exactly and removes the leading latitude-measure bias without changing the
+ * tensor-product angular topology.
+ */
+AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE amrex::Real
+latitude_cell_measure_ratio(const amrex::Real dtheta) noexcept {
+  return 2 * amrex::Math::sincos(dtheta / 2).first / dtheta;
+}
+
+/** Exact-latitude cell weight from a midpoint intrinsic area density. */
+AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE amrex::Real
+surface_cell_area_weight(const amrex::Real sqrt_determinant,
+                         const amrex::Real dtheta,
+                         const amrex::Real dphi) noexcept {
+  return sqrt_determinant * dtheta * dphi *
+         latitude_cell_measure_ratio(dtheta);
+}
+
+/**
  * Standard right-handed spherical basis with
  * x=r sin(theta) cos(phi), y=r sin(theta) sin(phi), z=r cos(theta).
  */

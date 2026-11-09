@@ -4,6 +4,7 @@
  */
 #include "surface_particle_container.hxx"
 #include "angular_geometry.hxx"
+#include "weyl_curvature.hxx"
 
 #include <AMReX_Gpu.H>
 #include <AMReX_GpuAtomic.H>
@@ -551,6 +552,187 @@ void SurfaceParticleContainer::redistribute_local_hierarchy(
   Redistribute(0, -1, 0, max_num_cells_moved, true);
 }
 
+void SurfaceParticleContainer::redistribute_active_band(
+    const int minimum_level, const int maximum_level,
+    const int max_num_cells_moved) {
+  if (minimum_level < 0 || maximum_level <= minimum_level ||
+      maximum_level > finestLevel() + 1 || max_num_cells_moved < 0)
+    amrex::Abort(
+        "ParticleAHFinderX received an invalid redistribution level band");
+  Redistribute(minimum_level, maximum_level - 1, 0, max_num_cells_moved,
+               true);
+}
+
+std::vector<SurfaceLevelRange>
+SurfaceParticleContainer::local_surface_level_ranges(
+    const std::vector<SurfaceLevelRequest> &requests) {
+  if (requests.size() >
+      static_cast<std::size_t>(std::numeric_limits<int>::max()))
+    amrex::Abort("ParticleAHFinderX surface level-range table exceeds the "
+                 "portable device-kernel index range");
+  for (std::size_t index = 0; index < requests.size(); ++index)
+    if (requests[index].stable_id <= 0 ||
+        requests[index].angular_level < -1 ||
+        (index > 0 && requests[index - 1].stable_id >=
+                          requests[index].stable_id))
+      amrex::Abort("ParticleAHFinderX surface level-range IDs must be unique "
+                   "and ordered, with a valid angular-layer selector");
+
+  std::vector<SurfaceLevelRange> result(requests.size());
+  if (requests.empty())
+    return result;
+
+  amrex::Gpu::DeviceVector<SurfaceLevelRequest> device_requests(
+      requests.size());
+  amrex::Gpu::copy(amrex::Gpu::hostToDevice, requests.begin(), requests.end(),
+                   device_requests.begin());
+  amrex::Gpu::DeviceVector<amrex::Long> device_counts(requests.size(), 0);
+  amrex::Gpu::DeviceVector<int> device_minimum(
+      requests.size(), std::numeric_limits<int>::max());
+  amrex::Gpu::DeviceVector<int> device_maximum(requests.size(), -1);
+  const auto *const selected = device_requests.dataPtr();
+  auto *const counts = device_counts.dataPtr();
+  auto *const minimum = device_minimum.dataPtr();
+  auto *const maximum = device_maximum.dataPtr();
+  const int surface_count = static_cast<int>(requests.size());
+
+  for (int lev = 0; lev <= finestLevel(); ++lev)
+    for (ParIter pti(*this, lev); pti.isValid(); ++pti) {
+      const int count = pti.numParticles();
+      if (count == 0)
+        continue;
+      const auto particles = pti.GetParticleTile().getParticleTileData();
+      amrex::ParallelFor(count, [=] AMREX_GPU_DEVICE(const int i) noexcept {
+        if (!particles.id(i).is_valid())
+          return;
+        const amrex::Long stable_id = surface_id_from_limbs(
+            particles.idata(IntIdx::surface_id_low)[i],
+            particles.idata(IntIdx::surface_id_middle)[i],
+            particles.idata(IntIdx::surface_id_high)[i]);
+        int lower = 0;
+        int upper = surface_count;
+        while (lower < upper) {
+          const int middle = lower + (upper - lower) / 2;
+          if (selected[middle].stable_id < stable_id)
+            lower = middle + 1;
+          else
+            upper = middle;
+        }
+        if (lower < surface_count &&
+            selected[lower].stable_id == stable_id &&
+            (selected[lower].angular_level < 0 ||
+             selected[lower].angular_level ==
+                 particles.idata(IntIdx::angular_level)[i])) {
+          amrex::Gpu::Atomic::AddNoRet(counts + lower, amrex::Long(1));
+          amrex::Gpu::Atomic::Min(minimum + lower, lev);
+          amrex::Gpu::Atomic::Max(maximum + lower, lev);
+        }
+      });
+    }
+
+  std::vector<amrex::Long> host_counts(requests.size());
+  std::vector<int> host_minimum(requests.size());
+  std::vector<int> host_maximum(requests.size());
+  amrex::Gpu::copy(amrex::Gpu::deviceToHost, device_counts.begin(),
+                   device_counts.end(), host_counts.begin());
+  amrex::Gpu::copy(amrex::Gpu::deviceToHost, device_minimum.begin(),
+                   device_minimum.end(), host_minimum.begin());
+  amrex::Gpu::copy(amrex::Gpu::deviceToHost, device_maximum.begin(),
+                   device_maximum.end(), host_maximum.begin());
+  for (std::size_t index = 0; index < requests.size(); ++index)
+    result[index] = {requests[index].stable_id, host_counts[index],
+                     host_counts[index] > 0 ? host_minimum[index] : -1,
+                     host_maximum[index]};
+  return result;
+}
+
+std::vector<SurfaceTranslationStats>
+SurfaceParticleContainer::local_active_band_translation_stats(
+    const std::vector<SurfaceCenterUpdate> &updates, const int minimum_level,
+    const int maximum_level) {
+  if (minimum_level < 0 || maximum_level <= minimum_level ||
+      maximum_level > finestLevel() + 1)
+    amrex::Abort("ParticleAHFinderX received an invalid translation level "
+                 "band");
+  if (updates.size() >
+      static_cast<std::size_t>(std::numeric_limits<int>::max()))
+    amrex::Abort("ParticleAHFinderX translation table exceeds the portable "
+                 "device-kernel index range");
+  for (std::size_t index = 0; index < updates.size(); ++index)
+    if (updates[index].surface_id <= 0 ||
+        (index > 0 &&
+         updates[index - 1].surface_id >= updates[index].surface_id))
+      amrex::Abort("ParticleAHFinderX translation surface IDs must be unique "
+                   "and ordered");
+
+  std::vector<SurfaceTranslationStats> result(updates.size());
+  if (updates.empty())
+    return result;
+
+  if (!m_particle_locator.isValid(GetParGDB(), do_tiling, tile_size))
+    m_particle_locator.build(GetParGDB(), do_tiling, tile_size);
+  m_particle_locator.setGeometry(GetParGDB());
+  const auto assign_grid = m_particle_locator.getGridAssignor();
+
+  amrex::Gpu::DeviceVector<SurfaceCenterUpdate> device_updates(updates.size());
+  amrex::Gpu::copy(amrex::Gpu::hostToDevice, updates.begin(), updates.end(),
+                   device_updates.begin());
+  amrex::Gpu::DeviceVector<amrex::Long> device_counts(updates.size(), 0);
+  amrex::Gpu::DeviceVector<amrex::Long> device_outside(updates.size(), 0);
+  const auto *const translations = device_updates.dataPtr();
+  auto *const counts = device_counts.dataPtr();
+  auto *const outside = device_outside.dataPtr();
+  const int update_count = static_cast<int>(updates.size());
+
+  for (int lev = minimum_level; lev < maximum_level; ++lev)
+    for (ParIter pti(*this, lev); pti.isValid(); ++pti) {
+      const int count = pti.numParticles();
+      if (count == 0)
+        continue;
+      const auto particles = pti.GetParticleTile().getParticleTileData();
+      amrex::ParallelFor(count, [=] AMREX_GPU_DEVICE(const int i) noexcept {
+        if (!particles.id(i).is_valid())
+          return;
+        const amrex::Long stable_id = surface_id_from_limbs(
+            particles.idata(IntIdx::surface_id_low)[i],
+            particles.idata(IntIdx::surface_id_middle)[i],
+            particles.idata(IntIdx::surface_id_high)[i]);
+        int lower = 0;
+        int upper = update_count;
+        while (lower < upper) {
+          const int middle = lower + (upper - lower) / 2;
+          if (translations[middle].surface_id < stable_id)
+            lower = middle + 1;
+          else
+            upper = middle;
+        }
+        if (lower >= update_count ||
+            translations[lower].surface_id != stable_id)
+          return;
+        amrex::Gpu::Atomic::AddNoRet(counts + lower, amrex::Long(1));
+        auto candidate = particles.getSuperParticle(i);
+        for (int d = 0; d < AMREX_SPACEDIM; ++d)
+          candidate.pos(d) += translations[lower].new_center[d] -
+                              translations[lower].old_center[d];
+        const auto destination = assign_grid(
+            candidate, minimum_level, maximum_level - 1, 0);
+        if (amrex::get<0>(destination) < 0)
+          amrex::Gpu::Atomic::AddNoRet(outside + lower, amrex::Long(1));
+      });
+    }
+
+  std::vector<amrex::Long> host_counts(updates.size());
+  std::vector<amrex::Long> host_outside(updates.size());
+  amrex::Gpu::copy(amrex::Gpu::deviceToHost, device_counts.begin(),
+                   device_counts.end(), host_counts.begin());
+  amrex::Gpu::copy(amrex::Gpu::deviceToHost, device_outside.begin(),
+                   device_outside.end(), host_outside.begin());
+  for (std::size_t index = 0; index < updates.size(); ++index)
+    result[index] =
+        {updates[index].surface_id, host_counts[index], host_outside[index]};
+  return result;
+}
+
 std::vector<amrex::Long> SurfaceParticleContainer::remap_logical_ownership(
     const std::vector<LogicalOwnership> &ownership) {
   if (ownership.size() >
@@ -880,6 +1062,410 @@ AdmGatherStats SurfaceParticleContainer::local_adm_gather_stats() const {
           amrex::get<2>(reduced), amrex::get<3>(reduced),
           amrex::get<4>(reduced), amrex::get<5>(reduced),
           amrex::get<6>(reduced)};
+}
+
+void SurfaceParticleContainer::gather_weyl_level(
+    const int lev, const amrex::MultiFab &metric, const int metric_component,
+    const amrex::MultiFab &curv, const int curv_component,
+    const FieldCentering centering, MeshWeylPoint *const mesh_points,
+    const amrex::Long container_source_offset) {
+  if (lev < 0 || lev > finestLevel() || !mesh_points ||
+      container_source_offset < 0)
+    amrex::Abort("ParticleAHFinderX Weyl gather received invalid storage or "
+                 "AMR metadata");
+
+  const auto prob_lo = Geom(lev).ProbLoArray();
+  const auto inv_dx = Geom(lev).InvCellSizeArray();
+  const auto domain = Geom(lev).Domain();
+  const bool has_fine_mask = lev < finestLevel();
+  if (has_fine_mask &&
+      (lev >= static_cast<int>(fine_masks_.size()) || !fine_masks_[lev]))
+    amrex::Abort("ParticleAHFinderX Weyl gather has no AMR fine mask");
+
+  amrex::Long source_offset = container_source_offset;
+  for (int lower_level = 0; lower_level < lev; ++lower_level)
+    for (ParIter pti(*this, lower_level); pti.isValid(); ++pti)
+      source_offset += pti.numParticles();
+
+  for (ParIter pti(*this, lev); pti.isValid(); ++pti) {
+    const int count = pti.numParticles();
+    if (count == 0)
+      continue;
+    auto particles = pti.GetParticleTile().getConstParticleTileData();
+    const auto metric_array = metric.const_array(pti);
+    const auto curv_array = curv.const_array(pti);
+    const amrex::Box metric_available = metric[pti].box();
+    const amrex::Box curv_available = curv[pti].box();
+    amrex::Array4<const int> fine_mask;
+    amrex::Box fine_mask_available;
+    if (has_fine_mask) {
+      fine_mask = fine_masks_[lev]->const_array(pti);
+      fine_mask_available = (*fine_masks_[lev])[pti].box();
+    }
+    const amrex::Long tile_source_offset = source_offset;
+    amrex::ParallelFor(count, [=] AMREX_GPU_DEVICE(const int i) noexcept {
+      if (!particles.id(i).is_valid() ||
+          particles.idata(IntIdx::solver_active)[i] == 0)
+        return;
+      auto &result = mesh_points[tile_source_offset + i];
+      if (static_cast<ParticleValidity>(
+              particles.idata(IntIdx::validity)[i]) !=
+          ParticleValidity::valid) {
+        result.status = static_cast<int>(WeylGatherStatus::invalid_adm);
+        return;
+      }
+
+      const amrex::GpuArray<amrex::Real, 3> position{{
+          particles.pos(0, i), particles.pos(1, i), particles.pos(2, i)}};
+      amrex::IntVect cell;
+      for (int d = 0; d < 3; ++d)
+        cell[d] = static_cast<int>(amrex::Math::floor(
+            (position[d] - prob_lo[d]) * inv_dx[d]));
+      if (!domain.contains(cell) ||
+          (has_fine_mask &&
+           (!fine_mask_available.contains(cell) || fine_mask(cell) == 0))) {
+        result.status =
+            static_cast<int>(WeylGatherStatus::stencil_unavailable);
+        return;
+      }
+
+      CurvatureDerivativeData derivatives;
+      const InterpolationStatus status =
+          tensor_cubic_interpolate_curvature_derivatives(
+              metric_array, metric_component, curv_array, curv_component,
+              position, prob_lo, inv_dx, centering, metric_available,
+              curv_available, derivatives);
+      if (status != InterpolationStatus::success) {
+        result.status = static_cast<int>(
+            status == InterpolationStatus::stencil_unavailable
+                ? WeylGatherStatus::stencil_unavailable
+                : WeylGatherStatus::nonfinite);
+        return;
+      }
+
+      WeylCurvatureInput input;
+      for (int component = 0; component < 6; ++component) {
+        input.gamma[component] =
+            particles.rdata(RealIdx::gamma_component(component))[i];
+        input.curv[component] =
+            particles.rdata(RealIdx::curv_component(component))[i];
+        for (int derivative = 0; derivative < 3; ++derivative) {
+          input.d_gamma[derivative][component] = particles.rdata(
+              RealIdx::d_gamma_component(derivative, component))[i];
+          input.d_curv[derivative][component] =
+              derivatives.d_curv[derivative][component];
+        }
+        for (int pair = 0; pair < 6; ++pair)
+          input.dd_gamma[pair][component] =
+              derivatives.dd_gamma[pair][component];
+      }
+      ElectricMagneticWeyl weyl;
+      if (!evaluate_electric_magnetic_weyl(input, weyl)) {
+        result.status = static_cast<int>(WeylGatherStatus::nonfinite);
+        return;
+      }
+      for (int component = 0; component < 6; ++component) {
+        result.electric[component] = weyl.electric[component];
+        result.magnetic[component] = weyl.magnetic[component];
+      }
+      result.status = static_cast<int>(WeylGatherStatus::valid);
+    });
+    source_offset += count;
+  }
+}
+
+WeylGatherStats SurfaceParticleContainer::local_weyl_gather_stats(
+    const MeshWeylPoint *const mesh_points,
+    const amrex::Long container_source_offset) const {
+  if (!mesh_points || container_source_offset < 0)
+    amrex::Abort("ParticleAHFinderX Weyl statistics received invalid "
+                 "device storage");
+  const amrex::Long count = local_particle_count();
+  amrex::ReduceOps<amrex::ReduceOpSum, amrex::ReduceOpSum,
+                   amrex::ReduceOpSum, amrex::ReduceOpSum>
+      reduce_ops;
+  amrex::ReduceData<amrex::Long, amrex::Long, amrex::Long, amrex::Long>
+      reduce_data(reduce_ops);
+  using ReduceTuple = typename decltype(reduce_data)::Type;
+  reduce_ops.eval(
+      count, reduce_data,
+      [=] AMREX_GPU_DEVICE(const amrex::Long index) noexcept -> ReduceTuple {
+        const auto status = static_cast<WeylGatherStatus>(
+            mesh_points[container_source_offset + index].status);
+        return {status == WeylGatherStatus::valid,
+                status == WeylGatherStatus::invalid_adm,
+                status == WeylGatherStatus::stencil_unavailable,
+                status == WeylGatherStatus::nonfinite};
+      });
+  const auto values = reduce_data.value();
+  return {amrex::get<0>(values), amrex::get<1>(values),
+          amrex::get<2>(values), amrex::get<3>(values)};
+}
+
+void SurfaceParticleContainer::gather_gauge_level(
+    const int lev, const amrex::MultiFab &lapse, const int lapse_component,
+    const amrex::MultiFab &shift, const int shift_component,
+    const amrex::MultiFab &dt_lapse, const int dt_lapse_component,
+    const amrex::MultiFab &dt_shift, const int dt_shift_component,
+    const FieldCentering centering, MeshGaugePoint *const mesh_points,
+    const amrex::Long container_source_offset) {
+  if (lev < 0 || lev > finestLevel() || !mesh_points ||
+      container_source_offset < 0)
+    amrex::Abort("ParticleAHFinderX gauge gather received invalid storage or "
+                 "AMR metadata");
+
+  const auto prob_lo = Geom(lev).ProbLoArray();
+  const auto inv_dx = Geom(lev).InvCellSizeArray();
+  const auto domain = Geom(lev).Domain();
+  const bool has_fine_mask = lev < finestLevel();
+  if (has_fine_mask &&
+      (lev >= static_cast<int>(fine_masks_.size()) || !fine_masks_[lev]))
+    amrex::Abort("ParticleAHFinderX gauge gather has no AMR fine mask");
+
+  amrex::Long source_offset = container_source_offset;
+  for (int lower_level = 0; lower_level < lev; ++lower_level)
+    for (ParIter pti(*this, lower_level); pti.isValid(); ++pti)
+      source_offset += pti.numParticles();
+
+  for (ParIter pti(*this, lev); pti.isValid(); ++pti) {
+    const int count = pti.numParticles();
+    if (count == 0)
+      continue;
+    const auto particles = pti.GetParticleTile().getConstParticleTileData();
+    const auto lapse_array = lapse.const_array(pti);
+    const auto shift_array = shift.const_array(pti);
+    const auto dt_lapse_array = dt_lapse.const_array(pti);
+    const auto dt_shift_array = dt_shift.const_array(pti);
+    const amrex::Box lapse_available = lapse[pti].box();
+    const amrex::Box shift_available = shift[pti].box();
+    const amrex::Box dt_lapse_available = dt_lapse[pti].box();
+    const amrex::Box dt_shift_available = dt_shift[pti].box();
+    amrex::Array4<const int> fine_mask;
+    amrex::Box fine_mask_available;
+    if (has_fine_mask) {
+      fine_mask = fine_masks_[lev]->const_array(pti);
+      fine_mask_available = (*fine_masks_[lev])[pti].box();
+    }
+    const amrex::Long tile_source_offset = source_offset;
+    amrex::ParallelFor(count, [=] AMREX_GPU_DEVICE(const int i) noexcept {
+      if (!particles.id(i).is_valid() ||
+          particles.idata(IntIdx::solver_active)[i] == 0)
+        return;
+      auto &result = mesh_points[tile_source_offset + i];
+      if (static_cast<ParticleValidity>(
+              particles.idata(IntIdx::validity)[i]) !=
+          ParticleValidity::valid) {
+        result.status = static_cast<int>(GaugeGatherStatus::invalid_adm);
+        return;
+      }
+
+      const amrex::GpuArray<amrex::Real, 3> position{{
+          particles.pos(0, i), particles.pos(1, i), particles.pos(2, i)}};
+      amrex::IntVect cell;
+      for (int d = 0; d < 3; ++d)
+        cell[d] = static_cast<int>(amrex::Math::floor(
+            (position[d] - prob_lo[d]) * inv_dx[d]));
+      if (!domain.contains(cell) ||
+          (has_fine_mask &&
+           (!fine_mask_available.contains(cell) || fine_mask(cell) == 0))) {
+        result.status =
+            static_cast<int>(GaugeGatherStatus::stencil_unavailable);
+        return;
+      }
+
+      amrex::GpuArray<amrex::Real, 3> gradient{{0, 0, 0}};
+      bool valid = tensor_cubic_interpolate(
+          lapse_array, lapse_component, position, prob_lo, inv_dx, centering,
+          lapse_available, result.value[FourGaugeLayout::lapse], gradient);
+      if (valid)
+        for (int d = 0; d < 3; ++d)
+          result.value[FourGaugeLayout::d_lapse + d] = gradient[d];
+
+      amrex::GpuArray<amrex::Real, 3> unused_gradient{{0, 0, 0}};
+      valid = valid && tensor_cubic_interpolate(
+                           dt_lapse_array, dt_lapse_component, position,
+                           prob_lo, inv_dx, centering, dt_lapse_available,
+                           result.value[FourGaugeLayout::dt_lapse],
+                           unused_gradient);
+      for (int component = 0; component < 3 && valid; ++component) {
+        gradient = {{0, 0, 0}};
+        valid = tensor_cubic_interpolate(
+            shift_array, shift_component + component, position, prob_lo,
+            inv_dx, centering, shift_available,
+            result.value[FourGaugeLayout::shift + component], gradient);
+        if (valid)
+          for (int derivative = 0; derivative < 3; ++derivative)
+            result.value[FourGaugeLayout::d_shift + 3 * derivative +
+                         component] = gradient[derivative];
+        valid = valid && tensor_cubic_interpolate(
+                             dt_shift_array, dt_shift_component + component,
+                             position, prob_lo, inv_dx, centering,
+                             dt_shift_available,
+                             result.value[FourGaugeLayout::dt_shift +
+                                          component],
+                             unused_gradient);
+      }
+      result.status = static_cast<int>(
+          valid ? GaugeGatherStatus::valid : GaugeGatherStatus::nonfinite);
+    });
+    source_offset += count;
+  }
+}
+
+GaugeGatherStats SurfaceParticleContainer::local_gauge_gather_stats(
+    const MeshGaugePoint *const mesh_points,
+    const amrex::Long container_source_offset) const {
+  if (!mesh_points || container_source_offset < 0)
+    amrex::Abort("ParticleAHFinderX gauge statistics received invalid "
+                 "device storage");
+  const amrex::Long count = local_particle_count();
+  amrex::ReduceOps<amrex::ReduceOpSum, amrex::ReduceOpSum,
+                   amrex::ReduceOpSum, amrex::ReduceOpSum>
+      reduce_ops;
+  amrex::ReduceData<amrex::Long, amrex::Long, amrex::Long, amrex::Long>
+      reduce_data(reduce_ops);
+  using ReduceTuple = typename decltype(reduce_data)::Type;
+  reduce_ops.eval(
+      count, reduce_data,
+      [=] AMREX_GPU_DEVICE(const amrex::Long index) noexcept -> ReduceTuple {
+        const auto status = static_cast<GaugeGatherStatus>(
+            mesh_points[container_source_offset + index].status);
+        return {status == GaugeGatherStatus::valid,
+                status == GaugeGatherStatus::invalid_adm,
+                status == GaugeGatherStatus::stencil_unavailable,
+                status == GaugeGatherStatus::nonfinite};
+      });
+  const auto values = reduce_data.value();
+  return {amrex::get<0>(values), amrex::get<1>(values),
+          amrex::get<2>(values), amrex::get<3>(values)};
+}
+
+void SurfaceParticleContainer::gather_matter_level(
+    const int lev, const amrex::MultiFab &tt, const int tt_component,
+    const amrex::MultiFab &ti, const int ti_component,
+    const amrex::MultiFab &ij, const int ij_component,
+    const FieldCentering centering, MeshMatterPoint *const mesh_points,
+    const amrex::Long container_source_offset) {
+  if (lev < 0 || lev > finestLevel() || !mesh_points ||
+      container_source_offset < 0)
+    amrex::Abort("ParticleAHFinderX matter gather received invalid storage or "
+                 "AMR metadata");
+
+  const auto prob_lo = Geom(lev).ProbLoArray();
+  const auto inv_dx = Geom(lev).InvCellSizeArray();
+  const auto domain = Geom(lev).Domain();
+  const bool has_fine_mask = lev < finestLevel();
+  if (has_fine_mask &&
+      (lev >= static_cast<int>(fine_masks_.size()) || !fine_masks_[lev]))
+    amrex::Abort("ParticleAHFinderX matter gather has no AMR fine mask");
+
+  amrex::Long source_offset = container_source_offset;
+  for (int lower_level = 0; lower_level < lev; ++lower_level)
+    for (ParIter pti(*this, lower_level); pti.isValid(); ++pti)
+      source_offset += pti.numParticles();
+
+  for (ParIter pti(*this, lev); pti.isValid(); ++pti) {
+    const int count = pti.numParticles();
+    if (count == 0)
+      continue;
+    const auto particles = pti.GetParticleTile().getConstParticleTileData();
+    const auto tt_array = tt.const_array(pti);
+    const auto ti_array = ti.const_array(pti);
+    const auto ij_array = ij.const_array(pti);
+    const amrex::Box tt_available = tt[pti].box();
+    const amrex::Box ti_available = ti[pti].box();
+    const amrex::Box ij_available = ij[pti].box();
+    amrex::Array4<const int> fine_mask;
+    amrex::Box fine_mask_available;
+    if (has_fine_mask) {
+      fine_mask = fine_masks_[lev]->const_array(pti);
+      fine_mask_available = (*fine_masks_[lev])[pti].box();
+    }
+    const amrex::Long tile_source_offset = source_offset;
+    amrex::ParallelFor(count, [=] AMREX_GPU_DEVICE(const int i) noexcept {
+      if (!particles.id(i).is_valid() ||
+          particles.idata(IntIdx::solver_active)[i] == 0)
+        return;
+      auto &result = mesh_points[tile_source_offset + i];
+      if (static_cast<ParticleValidity>(
+              particles.idata(IntIdx::validity)[i]) !=
+          ParticleValidity::valid) {
+        result.status = static_cast<int>(MatterGatherStatus::invalid_adm);
+        return;
+      }
+
+      const amrex::GpuArray<amrex::Real, 3> position{{
+          particles.pos(0, i), particles.pos(1, i), particles.pos(2, i)}};
+      amrex::IntVect cell;
+      for (int d = 0; d < 3; ++d)
+        cell[d] = static_cast<int>(amrex::Math::floor(
+            (position[d] - prob_lo[d]) * inv_dx[d]));
+      if (!domain.contains(cell) ||
+          (has_fine_mask &&
+           (!fine_mask_available.contains(cell) || fine_mask(cell) == 0))) {
+        result.status =
+            static_cast<int>(MatterGatherStatus::stencil_unavailable);
+        return;
+      }
+
+      bool valid = true;
+      for (int component = 0;
+           component < FourMatterLayout::component_count && valid;
+           ++component) {
+        amrex::Array4<const amrex::Real> values;
+        amrex::Box available;
+        int source_component = 0;
+        if (component == FourMatterLayout::tt) {
+          values = tt_array;
+          available = tt_available;
+          source_component = tt_component;
+        } else if (component <= FourMatterLayout::tz) {
+          values = ti_array;
+          available = ti_available;
+          source_component = ti_component + component - FourMatterLayout::tx;
+        } else {
+          values = ij_array;
+          available = ij_available;
+          source_component = ij_component + component - FourMatterLayout::xx;
+        }
+        amrex::GpuArray<amrex::Real, 3> unused_gradient{{0, 0, 0}};
+        valid = tensor_cubic_interpolate(
+            values, source_component, position, prob_lo, inv_dx, centering,
+            available, result.value[component], unused_gradient);
+      }
+      result.status = static_cast<int>(
+          valid ? MatterGatherStatus::valid : MatterGatherStatus::nonfinite);
+    });
+    source_offset += count;
+  }
+}
+
+MatterGatherStats SurfaceParticleContainer::local_matter_gather_stats(
+    const MeshMatterPoint *const mesh_points,
+    const amrex::Long container_source_offset) const {
+  if (!mesh_points || container_source_offset < 0)
+    amrex::Abort("ParticleAHFinderX matter statistics received invalid "
+                 "device storage");
+  const amrex::Long count = local_particle_count();
+  amrex::ReduceOps<amrex::ReduceOpSum, amrex::ReduceOpSum,
+                   amrex::ReduceOpSum, amrex::ReduceOpSum>
+      reduce_ops;
+  amrex::ReduceData<amrex::Long, amrex::Long, amrex::Long, amrex::Long>
+      reduce_data(reduce_ops);
+  using ReduceTuple = typename decltype(reduce_data)::Type;
+  reduce_ops.eval(
+      count, reduce_data,
+      [=] AMREX_GPU_DEVICE(const amrex::Long index) noexcept -> ReduceTuple {
+        const auto status = static_cast<MatterGatherStatus>(
+            mesh_points[container_source_offset + index].status);
+        return {status == MatterGatherStatus::valid,
+                status == MatterGatherStatus::invalid_adm,
+                status == MatterGatherStatus::stencil_unavailable,
+                status == MatterGatherStatus::nonfinite};
+      });
+  const auto values = reduce_data.value();
+  return {amrex::get<0>(values), amrex::get<1>(values),
+          amrex::get<2>(values), amrex::get<3>(values)};
 }
 
 amrex::Real SurfaceParticleContainer::local_minkowski_adm_error() const {

@@ -13,6 +13,7 @@
 #include <AMReX_MultiFab.H>
 
 #include <array>
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -33,6 +34,42 @@ struct AdmFieldLayout {
   int metric_component = 0;
   int curv_component = 0;
   FieldCentering centering;
+};
+
+/** Native-centered lapse/shift fields used only by four-dimensional analysis. */
+struct GaugeFieldLayout {
+  const amrex::MultiFab *lapse = nullptr;
+  const amrex::MultiFab *shift = nullptr;
+  const amrex::MultiFab *dt_lapse = nullptr;
+  const amrex::MultiFab *dt_shift = nullptr;
+  int lapse_component = 0;
+  int shift_component = 0;
+  int dt_lapse_component = 0;
+  int dt_shift_component = 0;
+  FieldCentering centering;
+};
+
+/** Native-centered covariant stress-energy fields used by Ricci analysis. */
+struct MatterFieldLayout {
+  const amrex::MultiFab *tt = nullptr;
+  const amrex::MultiFab *ti = nullptr;
+  const amrex::MultiFab *ij = nullptr;
+  int tt_component = 0;
+  int ti_component = 0;
+  int ij_component = 0;
+  FieldCentering centering;
+};
+
+struct ActiveLevelBand {
+  int minimum_level = 0;
+  int maximum_level = 0;
+  bool complete_hierarchy = false;
+  std::int64_t logical_iteration_numerator = 0;
+  std::int64_t logical_iteration_denominator = 1;
+
+  bool contains(const int level) const noexcept {
+    return level >= minimum_level && level < maximum_level;
+  }
 };
 
 /// Resolve a qualified three-dimensional CCTK_REAL grid function.
@@ -61,11 +98,22 @@ AdmFieldLayout adm_field_layout(
     const CarpetX::GHExt::PatchData::LevelData &level,
     const std::array<MeshFieldRef, 12> &fields);
 
+/** Resolve alpha, beta^i, and their coordinate-time derivatives. */
+GaugeFieldLayout gauge_field_layout(
+    const CarpetX::GHExt::PatchData::LevelData &level,
+    const std::array<MeshFieldRef, 8> &fields);
+
+/** Resolve the ten covariant TmunuBaseX components without recentering. */
+MatterFieldLayout matter_field_layout(
+    const CarpetX::GHExt::PatchData::LevelData &level,
+    const std::array<MeshFieldRef, 10> &fields);
+
 /// Synchronize only groups whose CarpetX validity lacks outer/ghost data.
 void ensure_mesh_fields_ready(const cGH *cctkGH,
                               const std::vector<MeshFieldRef> &fields);
 
-bool hierarchy_is_time_aligned();
+/// Return the synchronized CarpetX level band traversing the current schedule.
+ActiveLevelBand active_level_band();
 
 } // namespace ParticleAHFinderX
 

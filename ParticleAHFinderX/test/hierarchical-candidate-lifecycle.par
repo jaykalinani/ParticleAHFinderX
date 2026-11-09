@@ -1,0 +1,118 @@
+# Lifecycle test for bounded multi-generation common-surface composition.
+# Loose flat-space tolerances deliberately promote synthetic surfaces; this
+# tests ancestry, stable IDs, generation depth, and duplicate suppression, not
+# physical MOTS correctness.
+ActiveThorns = "
+  ADMBaseX
+  AH_analysis
+  CarpetX
+  IOUtil
+  ODESolvers
+  ParticleAHFinderX
+  Subcycling
+  TmunuBaseX
+"
+
+Cactus::presync_mode = "mixed-error"
+Cactus::cctk_itlast = 3
+
+CarpetX::xmin = -4.0
+CarpetX::ymin = -4.0
+CarpetX::zmin = -4.0
+CarpetX::xmax = 4.0
+CarpetX::ymax = 4.0
+CarpetX::zmax = 4.0
+CarpetX::ncells_x = 32
+CarpetX::ncells_y = 32
+CarpetX::ncells_z = 32
+CarpetX::blocking_factor_x = 8
+CarpetX::blocking_factor_y = 8
+CarpetX::blocking_factor_z = 8
+CarpetX::max_grid_size_x = 8
+CarpetX::max_grid_size_y = 8
+CarpetX::max_grid_size_z = 8
+CarpetX::ghost_size = 2
+CarpetX::dtfac = 0.25
+
+ADMBaseX::initial_data = "Cartesian Minkowski"
+ODESolvers::method = "RK4"
+
+ParticleAHFinderX::active = yes
+ParticleAHFinderX::verbose = yes
+ParticleAHFinderX::num_surfaces = 4
+ParticleAHFinderX::find_every = 1
+ParticleAHFinderX::solve_surfaces = yes
+ParticleAHFinderX::enable_angular_continuation = no
+ParticleAHFinderX::minimum_relaxation_steps = 0
+ParticleAHFinderX::maximum_relaxation_steps = 1
+ParticleAHFinderX::enable_dynamic_common_horizons = yes
+ParticleAHFinderX::maximum_active_candidates = 64
+ParticleAHFinderX::maximum_new_candidates_per_search = 8
+ParticleAHFinderX::candidate_trigger_factor = 4.0
+ParticleAHFinderX::candidate_ntheta = 8
+ParticleAHFinderX::candidate_nphi = 16
+ParticleAHFinderX::candidate_theta_l2_tolerance = 1.0e6
+ParticleAHFinderX::candidate_theta_linf_tolerance = 1.0e6
+ParticleAHFinderX::candidate_deduplication_center_tolerance = 1.0e-12
+ParticleAHFinderX::candidate_deduplication_area_tolerance = 1.0e-12
+ParticleAHFinderX::diagnostics_every = 1
+
+# Prove that promoted common surfaces are consumed by the complete schema-4
+# dynamic stable-ID analysis API without reserving a SphericalSurface slot.
+# This synthetic flat-space case validates dynamic identity and field plumbing;
+# the physical Kerr matrix remains the correctness oracle for the axial solve
+# and multipole values.
+AH_analysis::active = yes
+AH_analysis::published_only = yes
+AH_analysis::output_every = 1
+AH_analysis::out_dir = "$parfile/ah_analysis"
+AH_analysis::verbose = yes
+AH_analysis::print_analysis_timing = yes
+AH_analysis::compute_invariant_spin = yes
+AH_analysis::compute_multipoles = yes
+AH_analysis::ricci_source = "tmunu"
+
+ParticleAHFinderX::ntheta[0] = 8
+ParticleAHFinderX::nphi[0] = 16
+ParticleAHFinderX::initial_center_x[0] = -0.55
+ParticleAHFinderX::initial_center_y[0] = -0.20
+ParticleAHFinderX::initial_radius[0] = 0.36
+ParticleAHFinderX::mass_scale[0] = 0.35
+
+ParticleAHFinderX::ntheta[1] = 8
+ParticleAHFinderX::nphi[1] = 16
+ParticleAHFinderX::initial_center_x[1] = -0.18
+ParticleAHFinderX::initial_center_y[1] = 0.31
+ParticleAHFinderX::initial_radius[1] = 0.41
+ParticleAHFinderX::mass_scale[1] = 0.45
+
+ParticleAHFinderX::ntheta[2] = 8
+ParticleAHFinderX::nphi[2] = 16
+ParticleAHFinderX::initial_center_x[2] = 0.27
+ParticleAHFinderX::initial_center_y[2] = -0.29
+ParticleAHFinderX::initial_radius[2] = 0.44
+ParticleAHFinderX::mass_scale[2] = 0.55
+
+ParticleAHFinderX::ntheta[3] = 8
+ParticleAHFinderX::nphi[3] = 16
+ParticleAHFinderX::initial_center_x[3] = 0.61
+ParticleAHFinderX::initial_center_y[3] = 0.23
+ParticleAHFinderX::initial_radius[3] = 0.48
+ParticleAHFinderX::mass_scale[3] = 0.65
+
+ParticleAHFinderX::residual_profile[0] = "custom"
+ParticleAHFinderX::residual_profile[1] = "custom"
+ParticleAHFinderX::residual_profile[2] = "custom"
+ParticleAHFinderX::residual_profile[3] = "custom"
+ParticleAHFinderX::custom_theta_l2_tolerance[0] = 1.0e6
+ParticleAHFinderX::custom_theta_l2_tolerance[1] = 1.0e6
+ParticleAHFinderX::custom_theta_l2_tolerance[2] = 1.0e6
+ParticleAHFinderX::custom_theta_l2_tolerance[3] = 1.0e6
+ParticleAHFinderX::custom_theta_linf_tolerance[0] = 1.0e6
+ParticleAHFinderX::custom_theta_linf_tolerance[1] = 1.0e6
+ParticleAHFinderX::custom_theta_linf_tolerance[2] = 1.0e6
+ParticleAHFinderX::custom_theta_linf_tolerance[3] = 1.0e6
+
+IO::out_dir = $parfile
+IO::parfile_write = "no"
+CarpetX::out_metadata = no

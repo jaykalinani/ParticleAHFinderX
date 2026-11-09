@@ -6,6 +6,7 @@
 #define PARTICLEAHFINDERX_RELAXATION_HXX
 
 #include <AMReX_GpuQualifiers.H>
+#include <AMReX_Math.H>
 #include <AMReX_REAL.H>
 
 namespace ParticleAHFinderX {
@@ -17,8 +18,14 @@ enum class RelaxationIntegrator : int {
 
 enum class RelaxationExtrapolationMode : int {
   full_shape,
-  mean_height,
+  low_modes,
 };
+
+/** Alternate stored trajectory references with trials, starting at event 1. */
+AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE constexpr bool
+relaxation_extrapolation_reference_event(const int event) noexcept {
+  return event > 0 && event % 2 == 1;
+}
 
 /**
  * Extrapolate a recent surface trajectory.  An overstep of one restores the
@@ -31,12 +38,12 @@ relaxation_extrapolated_height(const amrex::Real previous,
   return current + (overstep - 1) * (current - previous);
 }
 
-/** Continue only the constant spherical mode of a recent trajectory. */
+/** Continue a supplied low-angular-mode displacement of a recent trajectory. */
 AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE amrex::Real
-relaxation_extrapolated_mean_height(
-    const amrex::Real current, const amrex::Real mean_displacement,
+relaxation_extrapolated_low_modes(
+    const amrex::Real current, const amrex::Real low_mode_displacement,
     const amrex::Real overstep) noexcept {
-  return current + (overstep - 1) * mean_displacement;
+  return current + (overstep - 1) * low_mode_displacement;
 }
 
 /**
@@ -85,6 +92,57 @@ relaxation_stage_value(const RelaxationIntegrator integrator, const int stage,
   if (stage == 2)
     return base + dt * current_rhs;
   return base + dt * (rhs_1 + 2 * rhs_2 + 2 * rhs_3 + current_rhs) / 6;
+}
+
+struct RelaxationStageUpdate {
+  amrex::Real height;
+  amrex::Real velocity;
+  bool valid;
+};
+
+/** Form and validate the point update shared by fused and stencil stages. */
+AMREX_GPU_HOST_DEVICE AMREX_FORCE_INLINE RelaxationStageUpdate
+relaxation_stage_update(
+    const RelaxationIntegrator integrator, const int stage,
+    const amrex::Long point_count, const amrex::Long point,
+    const amrex::Real *const base, const amrex::Real *const rhs,
+    const amrex::Real dt, const amrex::Real current_rhs_height,
+    const amrex::Real current_rhs_velocity,
+    const amrex::Real minimum_radius,
+    const amrex::Real maximum_radius) noexcept {
+  amrex::Real rhs_height_1 = 0;
+  amrex::Real rhs_height_2 = 0;
+  amrex::Real rhs_height_3 = 0;
+  amrex::Real rhs_velocity_1 = 0;
+  amrex::Real rhs_velocity_2 = 0;
+  amrex::Real rhs_velocity_3 = 0;
+  if ((integrator == RelaxationIntegrator::ssprk3 && stage >= 1) ||
+      (integrator == RelaxationIntegrator::rk4 && stage == 3)) {
+    rhs_height_1 = rhs[point];
+    rhs_velocity_1 = rhs[point_count + point];
+  }
+  if ((integrator == RelaxationIntegrator::ssprk3 && stage >= 2) ||
+      (integrator == RelaxationIntegrator::rk4 && stage == 3)) {
+    rhs_height_2 = rhs[2 * point_count + point];
+    rhs_velocity_2 = rhs[3 * point_count + point];
+  }
+  if (integrator == RelaxationIntegrator::rk4 && stage == 3) {
+    rhs_height_3 = rhs[4 * point_count + point];
+    rhs_velocity_3 = rhs[5 * point_count + point];
+  }
+  RelaxationStageUpdate result;
+  result.height = relaxation_stage_value(
+      integrator, stage, base[point], dt, rhs_height_1, rhs_height_2,
+      rhs_height_3, current_rhs_height);
+  result.velocity = relaxation_stage_value(
+      integrator, stage, base[point_count + point], dt,
+      rhs_velocity_1, rhs_velocity_2, rhs_velocity_3,
+      current_rhs_velocity);
+  result.valid = amrex::Math::isfinite(result.height) &&
+                 amrex::Math::isfinite(result.velocity) &&
+                 result.height >= minimum_radius &&
+                 result.height <= maximum_radius;
+  return result;
 }
 
 } // namespace ParticleAHFinderX

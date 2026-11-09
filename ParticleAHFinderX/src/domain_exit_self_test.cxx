@@ -18,9 +18,9 @@ namespace ParticleAHFinderX {
 extern "C" void ParticleAHFinderX_DomainExitSelfTest(CCTK_ARGUMENTS) {
   DECLARE_CCTK_ARGUMENTS;
   DECLARE_CCTK_PARAMETERS;
-  if (!run_domain_exit_self_test)
-    return;
   auto &state = runtime();
+  if (!run_domain_exit_self_test || state.domain_exit_self_test_complete)
+    return;
   if (!retire_on_domain_exit || domain_exit_grace_searches != 1 ||
       state.surfaces.size() != 1 || state.containers.empty() ||
       !state.logical_surfaces || !state.initial_surfaces_created)
@@ -65,7 +65,8 @@ extern "C" void ParticleAHFinderX_DomainExitSelfTest(CCTK_ARGUMENTS) {
   std::vector<amrex::Long> due_surface_ids{surface.stable_id};
   predict_surface_centers(cctkGH, state, due_surface_ids, cctk_iteration,
                           static_cast<amrex::Real>(cctk_time),
-                          maximum_center_extrapolation_intervals);
+                          maximum_center_extrapolation_intervals, 0,
+                          state.containers.front()->finestLevel() + 1, true);
 
   amrex::Long particle_count = 0;
   for (const auto &container : state.containers)
@@ -86,6 +87,7 @@ extern "C" void ParticleAHFinderX_DomainExitSelfTest(CCTK_ARGUMENTS) {
 
   CCTK_INFO("Domain-exit retirement self-test passed on the active AMReX "
             "backend: persistent particle and logical counts are zero");
+  state.domain_exit_self_test_complete = true;
 }
 
 } // namespace ParticleAHFinderX

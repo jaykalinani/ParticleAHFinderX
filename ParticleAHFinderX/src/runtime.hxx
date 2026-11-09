@@ -7,7 +7,9 @@
 
 #include "carpetx_adapter.hxx"
 #include "logical_surface_storage.hxx"
+#include "radial_geometry_cache.hxx"
 #include "surface_particle_container.hxx"
+#include "surface_router.hxx"
 
 #include <AMReX_REAL.H>
 
@@ -20,6 +22,26 @@ namespace ParticleAHFinderX {
 constexpr int max_configured_surfaces = 256;
 constexpr int max_compatibility_slots = 256;
 constexpr int max_angular_layers = 8;
+
+enum class CandidateEventType : int {
+  birth = 1,
+  attempt = 2,
+  promotion = 3,
+  retirement = 4,
+};
+
+enum class CandidateEventReason : int {
+  created = 1,
+  solver_not_converged = 2,
+  invalid_geometry = 3,
+  parent_containment_failed = 4,
+  duplicate_published_surface = 5,
+  accepted = 6,
+  attempt_limit = 7,
+  separation_expired = 8,
+  parent_unavailable = 9,
+  outside_domain = 10,
+};
 
 enum class CenterPolicy : int {
   manual,
@@ -134,9 +156,42 @@ struct SurfaceRecord {
   int last_search_iteration = -1;
   int last_success_iteration = -1;
   int last_history_iteration = -1;
+  int last_native_diagnostics_iteration = -1;
+  int last_compatibility_diagnostics_iteration = -1;
+  // Runtime-only consumption watermark for the collective analysis API. It is
+  // intentionally not checkpointed. The output consumer independently loads
+  // stable-ID watermarks and preserves the committed checkpoint iteration.
+  int last_analysis_api_iteration = -1;
   amrex::Real last_search_time = 0;
   int last_search_steps = 0;
   CenterHistory center_history;
+};
+
+/** One bounded lifecycle event for a provisional common surface. */
+struct CandidateEvent {
+  int iteration = -1;
+  amrex::Real time = 0;
+  amrex::Long stable_id = 0;
+  std::array<amrex::Long, 2> parent_ids{{0, 0}};
+  amrex::Long related_surface_id = 0;
+  int generation = 0;
+  CandidateEventType type = CandidateEventType::birth;
+  CandidateEventReason reason = CandidateEventReason::created;
+  int attempt = 0;
+  std::array<amrex::Real, 3> center{{0, 0, 0}};
+  amrex::Real parent_separation = 0;
+  amrex::Real trigger_distance = 0;
+  amrex::Real expiry_distance = 0;
+  amrex::Real radius = 0;
+  amrex::Real minimum_radius = 0;
+  amrex::Real maximum_radius = 0;
+  amrex::Real area = 0;
+  amrex::Real expansion_l2 = 0;
+  amrex::Real expansion_linf = 0;
+  amrex::Long invalid_points = 0;
+  int relaxation_steps = 0;
+  int next_search_iteration = -1;
+  amrex::Long particle_count = 0;
 };
 
 struct Runtime {
@@ -144,8 +199,33 @@ struct Runtime {
   // non-search iteration. Only shutdown destroys them.
   std::vector<std::unique_ptr<SurfaceParticleContainer>> containers;
   std::unique_ptr<LogicalSurfaceStorage> logical_surfaces;
+  std::unique_ptr<RadialGeometryCache> radial_geometry_cache;
   std::vector<SurfaceRecord> surfaces;
+  // Candidate events are compact replicated metadata. The analysis schedule
+  // flushes them before checkpointing, including when ordinary diagnostics
+  // are disabled or use a coarser cadence.
+  std::vector<CandidateEvent> pending_candidate_events;
+  // Persistent compact analysis buffers. Angular point data remain in
+  // LogicalSurfaceStorage; these arrays contain only O(number of surfaces)
+  // records in globally sorted stable-ID order. The table contains only
+  // surfaces searched and not yet consumed in the current iteration, so
+  // retired candidate history cannot enlarge later collectives.
+  std::vector<amrex::Long> analysis_surface_ids;
+  amrex::Gpu::DeviceVector<amrex::Long> analysis_surface_ids_device;
+  amrex::Gpu::DeviceVector<amrex::Real> analysis_reals_device;
+  amrex::Gpu::DeviceVector<amrex::Long> analysis_longs_device;
+  // The final surviving, converged target-layer route remains valid until the
+  // immediately following analysis schedule. Optional curvature and
+  // four-metric analysis reuse its exact mesh/logical topology and transient
+  // mesh-owner buffers; failed or retired candidates are never included.
+  SurfaceRoutePlan analysis_route_plan;
+  amrex::Gpu::DeviceVector<MeshWeylPoint> analysis_weyl_mesh_device;
+  amrex::Gpu::DeviceVector<MeshGaugePoint> analysis_gauge_mesh_device;
+  amrex::Gpu::DeviceVector<MeshMatterPoint> analysis_matter_mesh_device;
+  amrex::Long analysis_active_point_count = 0;
   std::array<MeshFieldRef, 12> adm_fields{};
+  std::array<MeshFieldRef, 8> analysis_gauge_fields{};
+  std::array<MeshFieldRef, 10> analysis_matter_fields{};
   std::array<CenterProviderRef, max_configured_surfaces> center_providers{};
   std::array<ResidualTolerances, max_configured_surfaces> tolerances{};
   amrex::Long next_surface_id = 1;
@@ -155,19 +235,36 @@ struct Runtime {
   int num_patches = 0;
   int last_particle_output_iteration = -1;
   int last_diagnostics_iteration = -1;
-  int last_spherical_export_iteration = -1;
   int last_checkpoint_iteration = -1;
   int last_checkpoint_runtime = -1;
   int recovered_iteration = -1;
+  int interpolation_order = 3;
+  // Runtime-only guard for truncating output left by an abandoned trajectory.
+  int reconciled_diagnostics_recovery_iteration = -1;
   int last_adm_gather_iteration = -1;
   int last_logical_route_iteration = -1;
-  int last_center_prediction_iteration = -1;
   int last_relaxation_steps = 0;
-  amrex::Real last_expansion_l2 = 0;
-  amrex::Real last_expansion_linf = 0;
   bool setup = false;
+  // Initial particle birth occurs while CarpetX may still be constructing
+  // refinement levels. Finalize mesh-aware logical owners at the first
+  // complete hierarchy, before any physical surface has been searched.
+  bool initial_spatial_ownership_finalized = false;
   bool initial_surfaces_created = false;
   bool reported_adm_centering = false;
+  bool analysis_gauge_fields_resolved = false;
+  bool analysis_matter_fields_resolved = false;
+  // CarpetX can re-enter POSTINITIAL while constructing refinement levels.
+  // Optional accelerator self-tests are process-run checks, not level-local
+  // initialization, and must therefore execute only once.
+  bool interpolation_self_test_complete = false;
+  bool angular_self_test_complete = false;
+  bool intrinsic_geometry_self_test_complete = false;
+  bool axial_symmetry_self_test_complete = false;
+  bool coordinate_flux_self_test_complete = false;
+  bool weyl_curvature_self_test_complete = false;
+  bool four_dimensional_analysis_self_test_complete = false;
+  bool relaxation_self_test_complete = false;
+  bool domain_exit_self_test_complete = false;
   bool adm_gather_self_test_complete = false;
   bool expansion_self_test_complete = false;
   bool last_search_converged = false;

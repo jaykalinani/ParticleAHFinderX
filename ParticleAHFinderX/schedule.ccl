@@ -13,11 +13,12 @@ if (active) {
     OPTIONS: global
   } "Resolve ADM fields and initialize ParticleAHFinderX runtime metadata"
 
-  SCHEDULE ParticleAHFinderX_Initialise AT postinitial
+  SCHEDULE ParticleAHFinderX_Initialise AT postrestrictinitial
+    BEFORE ADMBaseX_PostInitialHierarchy
   {
     LANG: C
     OPTIONS: global
-  } "Create configured horizon particles once in persistent AMReX storage"
+  } "Create persistent horizon particles on the finalized initial hierarchy"
 
   SCHEDULE ParticleAHFinderX_Recover AT post_recover_variables
   {
@@ -47,8 +48,43 @@ if (active) {
     OPTIONS: global
   } "Validate portable latitude/longitude differential operators"
 
-  SCHEDULE ParticleAHFinderX_RelaxationSelfTest AT postinitial
+  SCHEDULE ParticleAHFinderX_IntrinsicGeometrySelfTest AT postinitial
     AFTER ParticleAHFinderX_AngularSelfTest
+  {
+    LANG: C
+    OPTIONS: global
+  } "Validate polar-regular intrinsic horizon geometry"
+
+  SCHEDULE ParticleAHFinderX_AxialSymmetrySelfTest AT postinitial
+    AFTER ParticleAHFinderX_IntrinsicGeometrySelfTest
+  {
+    LANG: C
+    OPTIONS: global
+  } "Validate the variational axial mode on the accelerator"
+
+  SCHEDULE ParticleAHFinderX_CoordinateFluxSelfTest AT postinitial
+    AFTER ParticleAHFinderX_AxialSymmetrySelfTest
+  {
+    LANG: C
+    OPTIONS: global
+  } "Validate finite-radius coordinate fluxes on the accelerator"
+
+  SCHEDULE ParticleAHFinderX_WeylCurvatureSelfTest AT postinitial
+    AFTER ParticleAHFinderX_CoordinateFluxSelfTest
+  {
+    LANG: C
+    OPTIONS: global
+  } "Validate native 3+1 Weyl curvature on the accelerator"
+
+  SCHEDULE ParticleAHFinderX_FourDimensionalAnalysisSelfTest AT postinitial
+    AFTER ParticleAHFinderX_WeylCurvatureSelfTest
+  {
+    LANG: C
+    OPTIONS: global
+  } "Validate four-dimensional horizon-analysis algebra on the accelerator"
+
+  SCHEDULE ParticleAHFinderX_RelaxationSelfTest AT postinitial
+    AFTER ParticleAHFinderX_FourDimensionalAnalysisSelfTest
   {
     LANG: C
     OPTIONS: global
@@ -64,7 +100,7 @@ if (active) {
   {
     LANG: C
     OPTIONS: global
-  } "Run due apparent-horizon searches only at synchronized hierarchy times"
+  } "Run each due apparent-horizon search on its synchronized active-level band"
 
   SCHEDULE ParticleAHFinderX_Diagnostics AT analysis
     AFTER ParticleAHFinderX_Analysis
@@ -72,14 +108,6 @@ if (active) {
     LANG: C
     OPTIONS: global
   } "Write bounded per-surface diagnostics"
-
-  SCHEDULE ParticleAHFinderX_ExportSphericalSurfaces AT analysis
-    AFTER ParticleAHFinderX_Analysis
-    BEFORE SphericalSurface_HasBeenSet
-  {
-    LANG: C
-    OPTIONS: global
-  } "Export selected converged surfaces through the bounded compatibility bridge"
 
   SCHEDULE ParticleAHFinderX_Output AT analysis
     AFTER ParticleAHFinderX_Diagnostics

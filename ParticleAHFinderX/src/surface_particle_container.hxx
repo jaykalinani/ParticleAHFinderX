@@ -8,6 +8,7 @@
 #ifndef PARTICLEAHFINDERX_SURFACE_PARTICLE_CONTAINER_HXX
 #define PARTICLEAHFINDERX_SURFACE_PARTICLE_CONTAINER_HXX
 
+#include "four_dimensional_analysis.hxx"
 #include "interpolation.hxx"
 
 #include <AMReX_AmrParticles.H>
@@ -150,6 +151,89 @@ struct AdmGatherStats {
   amrex::Long nonfinite = 0;
 };
 
+enum class WeylGatherStatus : int {
+  inactive = 0,
+  valid = 1,
+  invalid_adm = 2,
+  stencil_unavailable = 3,
+  nonfinite = 4,
+};
+
+/** Transient curvature payload indexed like the mesh-owner particle route. */
+struct MeshWeylPoint {
+  amrex::Real electric[6]{};
+  amrex::Real magnetic[6]{};
+  int status = static_cast<int>(WeylGatherStatus::inactive);
+};
+
+struct WeylGatherStats {
+  amrex::Long valid = 0;
+  amrex::Long invalid_adm = 0;
+  amrex::Long stencil_unavailable = 0;
+  amrex::Long nonfinite = 0;
+};
+
+enum class GaugeGatherStatus : int {
+  inactive = 0,
+  valid = 1,
+  invalid_adm = 2,
+  stencil_unavailable = 3,
+  nonfinite = 4,
+};
+
+/** Transient gauge payload indexed like the mesh-owner particle route. */
+struct MeshGaugePoint {
+  amrex::Real value[FourGaugeLayout::component_count]{};
+  int status = static_cast<int>(GaugeGatherStatus::inactive);
+};
+
+struct GaugeGatherStats {
+  amrex::Long valid = 0;
+  amrex::Long invalid_adm = 0;
+  amrex::Long stencil_unavailable = 0;
+  amrex::Long nonfinite = 0;
+};
+
+enum class MatterGatherStatus : int {
+  inactive = 0,
+  valid = 1,
+  invalid_adm = 2,
+  stencil_unavailable = 3,
+  nonfinite = 4,
+};
+
+/** Transient covariant T_ab payload indexed by the mesh-owner route. */
+struct MeshMatterPoint {
+  amrex::Real value[FourMatterLayout::component_count]{};
+  int status = static_cast<int>(MatterGatherStatus::inactive);
+};
+
+struct MatterGatherStats {
+  amrex::Long valid = 0;
+  amrex::Long invalid_adm = 0;
+  amrex::Long stencil_unavailable = 0;
+  amrex::Long nonfinite = 0;
+};
+
+struct SurfaceLevelRange {
+  amrex::Long stable_id = 0;
+  amrex::Long particle_count = 0;
+  int minimum_level = -1;
+  int maximum_level = -1;
+};
+
+struct SurfaceLevelRequest {
+  amrex::Long stable_id = 0;
+  /// A specific persistent angular layer, or -1 for every layer at acquisition.
+  int angular_level = -1;
+};
+
+struct SurfaceTranslationStats {
+  amrex::Long stable_id = 0;
+  amrex::Long particle_count = 0;
+  amrex::Long outside_active_band = 0;
+};
+
 struct PhysicalDomainBounds {
   std::array<amrex::Real, 3> lower{{0, 0, 0}};
   std::array<amrex::Real, 3> upper{{0, 0, 0}};
@@ -190,6 +274,17 @@ struct SurfaceLayerSelection {
   int angular_level = 0;
 };
 
+enum class SurfaceProlongationMode : int {
+  replace = 0,
+  additive_correction = 1,
+};
+
+struct SurfaceLayerProlongation {
+  amrex::Long stable_id = 0;
+  int angular_level = 0;
+  SurfaceProlongationMode mode = SurfaceProlongationMode::replace;
+};
+
 class SurfaceParticleContainer final : public BaseContainer {
 public:
   explicit SurfaceParticleContainer(amrex::AmrCore *core);
@@ -222,6 +317,28 @@ public:
   void redistribute_global();
   /// Migrate nearby particles after bounded motion at synchronized times.
   void redistribute_local_hierarchy(int max_num_cells_moved);
+  /// Redistribute only within one synchronized half-open level band.
+  void redistribute_active_band(int minimum_level, int maximum_level,
+                                int max_num_cells_moved);
+
+  /** Return bounded per-surface AMR ownership metadata.
+   *
+   * A request selects either one persistent angular layer or every layer. The
+   * returned order matches the ordered, unique input IDs; only this compact
+   * metadata is copied to the host.
+   */
+  std::vector<SurfaceLevelRange> local_surface_level_ranges(
+      const std::vector<SurfaceLevelRequest> &requests);
+
+  /** Preflight rigid translations against a synchronized active level band.
+   *
+   * Proposed positions are tested by AMReX's portable device locator without
+   * modifying or redistributing the persistent population. Only one bounded
+   * count pair per proposed surface is returned to the host.
+   */
+  std::vector<SurfaceTranslationStats> local_active_band_translation_stats(
+      const std::vector<SurfaceCenterUpdate> &updates, int minimum_level,
+      int maximum_level);
 
   /** Replace checkpointed logical-owner metadata for the current MPI layout.
    *
@@ -248,6 +365,49 @@ public:
 
   /// Compact device reduction of the most recent gather statuses.
   AdmGatherStats local_adm_gather_stats() const;
+
+  /** Gather the higher derivatives used only by optional Weyl analysis.
+   *
+   * `mesh_points` is a reusable device buffer in the same flattened
+   * container/level/tile order as SurfaceRouter's source indices. The method
+   * computes the twelve electric/magnetic tensor components immediately, so
+   * the 54 interpolated derivatives never enter persistent particle storage
+   * or MPI payloads.
+   */
+  void gather_weyl_level(int lev, const amrex::MultiFab &metric,
+                         int metric_component,
+                         const amrex::MultiFab &curv,
+                         int curv_component, FieldCentering centering,
+                         MeshWeylPoint *mesh_points,
+                         amrex::Long container_source_offset);
+
+  WeylGatherStats local_weyl_gather_stats(
+      const MeshWeylPoint *mesh_points,
+      amrex::Long container_source_offset) const;
+
+  /** Gather alpha, beta^i, and their first derivatives for 4D analysis. */
+  void gather_gauge_level(
+      int lev, const amrex::MultiFab &lapse, int lapse_component,
+      const amrex::MultiFab &shift, int shift_component,
+      const amrex::MultiFab &dt_lapse, int dt_lapse_component,
+      const amrex::MultiFab &dt_shift, int dt_shift_component,
+      FieldCentering centering, MeshGaugePoint *mesh_points,
+      amrex::Long container_source_offset);
+
+  GaugeGatherStats local_gauge_gather_stats(
+      const MeshGaugePoint *mesh_points,
+      amrex::Long container_source_offset) const;
+
+  /** Gather the ten native covariant TmunuBaseX components. */
+  void gather_matter_level(
+      int lev, const amrex::MultiFab &tt, int tt_component,
+      const amrex::MultiFab &ti, int ti_component,
+      const amrex::MultiFab &ij, int ij_component, FieldCentering centering,
+      MeshMatterPoint *mesh_points, amrex::Long container_source_offset);
+
+  MatterGatherStats local_matter_gather_stats(
+      const MeshMatterPoint *mesh_points,
+      amrex::Long container_source_offset) const;
 
   /// Maximum error against Cartesian Minkowski ADM data, for validation only.
   amrex::Real local_minkowski_adm_error() const;

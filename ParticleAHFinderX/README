@@ -108,6 +108,14 @@ where w_p is the discrete proper-area weight. Invalid geometry, a missing
 interpolation stencil, a non-finite update, or a radius-guard violation fails
 that surface and restores its last committed state.
 
+The latitude part of w_p uses the exact solid angle of each unit-sphere cell,
+
+  Delta Omega_ij = 2 sin(theta_i) sin(Delta theta/2) Delta phi,
+
+with midpoint sampling only for the regular ratio sqrt(q)/sin(theta). This
+integrates a coordinate sphere exactly instead of retaining the leading
+midpoint bias from sin(theta).
+
 
 4. Spatial and Angular Discretization
 ======================================
@@ -152,12 +160,24 @@ At every synchronized search time, the thorn performs the following steps:
    weights, Theta, and the two residual norms.
 6. Advance h and v with SSPRK3 or RK4 using the per-surface CFL timestep.
    Radius and finite-value checks are applied atomically per surface.
-7. Rebuild particle positions, redistribute as needed, and resample the same
-   physical-time geometry after each complete pseudo-time step.
+7. In the direct path, rebuild particle positions, redistribute as needed, and
+   resample the same physical-time geometry after each complete pseudo-time
+   step. The optional radial-cache path leaves the persistent AH particles on
+   their physical surface and forms bounded derived probe requests on the
+   logical-owner GPU. Mesh owners sample those probes in portable accelerator
+   kernels and return the 30-component ADM payload through GPU-aware MPI.
+   Pseudo-time lookup then remains local to the logical-owner GPU. A terminal
+   cached result is always validated by authoritative direct mesh sampling.
+   If that check reopens a layer, an optional bounded cache pass is recentered
+   on the near-root shape with a narrower interval; only reopened owner-local
+   layers are probed. A configured direct-step reserve forces an inconclusive
+   cached solve back through direct sampling before the iteration ceiling.
 8. Stop converged surfaces immediately. Optionally test recent-trajectory
    extrapolations and accept only those that reduce the normalized residual.
 9. For angular continuation, prolong a successful coarse layer and repeat the
-   solve through the configured target layer.
+   solve through the configured target layer. During established tracking,
+   prolong coarse changes additively so resolved fine-grid shape is retained;
+   only internal helpers may use the configurable relaxed helper tolerance.
 10. Atomically commit successful surfaces. Failed searches restore the last
     committed shape and update retry state without publishing a partial result.
 
@@ -208,6 +228,7 @@ single-surface configuration is:
   ParticleAHFinderX::residual_profile[0] = "dynamic_tracking"
 
   ParticleAHFinderX::enable_angular_continuation = yes
+  ParticleAHFinderX::use_multilevel_tracking = yes
   ParticleAHFinderX::relaxation_integrator = "ssprk3"
   ParticleAHFinderX::diagnostics_every = 1
 
@@ -226,33 +247,50 @@ See `param.ccl` for all parameters and `test/` for small regression inputs.
 
 `diagnostics_every` writes bounded per-surface diagnostics, including stable
 IDs, lineage, center, radii, area, irreducible mass, circumferences, expansion
-norms, solver steps, and sampled AMR levels. `particle_out_every` writes
-parallel openPMD/ADIOS2 BP5 particle snapshots for visualization.
+norms, solver steps, and sampled AMR levels. Each native TSV defines every
+column and integer status code. `particle_out_every` writes parallel
+openPMD/ADIOS2 BP5 particle snapshots for visualization; the particle species
+stores the same lifecycle, role, validity, and field-meaning legends as BP5
+metadata.
+Candidate birth, failed attempts, promotion, and retirement are recorded in
+`candidate_events.tsv` with lineage, encounter thresholds, solve evidence,
+and explicit decision reasons, even when the regular diagnostic cadence is
+coarser.
 
-Optional compatibility output provides familiar `BH_diagnostics.ahN.gp`
-files and bounded SphericalSurface export. These host-side products are
-outside the nonlinear solver loop. Checkpoints preserve particles, logical
-surface state, tracking history, candidates, lineage, and output state, and
-may be recovered with a different MPI rank count.
+Optional compatibility diagnostics provide familiar `BH_diagnostics.ahN.gp`
+files with AHFinderDirect's 40-column names and order without changing the
+native surface representation. Dynamic quasi-local
+analysis is performed directly by `AH_analysis`; ParticleAHFinderX has no
+SphericalSurface or QuasiLocalMeasures interface. Checkpoints preserve
+particles, logical surface state, tracking history, candidates, lineage, and
+output state, and may be recovered with a different MPI rank count.
 
 
 9. Current Limitations
 ======================
 
-- Searches currently run only at fully synchronized CarpetX hierarchy times.
+- Active-level-band searches, asynchronous deferral, coarse/fine crossings,
+  moving regrids, and changed-rank recovery pass the current CUDA runtime
+  gates. The new recentered-cache source still requires a fresh build and
+  repeat of those gates.
+- Radial-cache construction supports synchronized partial active bands. A
+  cache whose derived probes require an inactive level falls back to direct
+  sampling without deferring an otherwise eligible physical surface.
 - The supported geometry is one star-shaped S^2 radial graph per surface.
 - One logical GPU owns each complete angular surface; a single surface is not
   angularly sharded.
 - Only a Cartesian CarpetX patch is currently supported.
-- CUDA and CPU/OpenMP builds have been exercised; HIP and SYCL validation is
-  still pending.
+- The latest released-source CUDA runtime gates pass. The current unbuilt
+  source still requires CUDA, HIP, and CPU/OpenMP build/runtime validation;
+  direct vendor APIs are forbidden by the portability audit.
 
 
 10. References
 ==============
 
 - Z. B. Etienne, T. Assumpcao, L. R. Werneck, and S. D. Tootle,
-  arXiv:2505.15912, https://arxiv.org/abs/2505.15912.
+  "BHaHAHA: A Fast, Robust Apparent Horizon Finder Library for Numerical
+  Relativity," arXiv:2505.15912, https://arxiv.org/abs/2505.15912.
 - J. Thornburg, Class. Quantum Grav. 21, 743-766 (2004),
   https://doi.org/10.1088/0264-9381/21/2/026.
 - F. Loeffler et al., Class. Quantum Grav. 29, 115001 (2012),
